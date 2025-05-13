@@ -20,3 +20,4 @@ router.post('/onboard-partner', authMiddleware, async (req, res) => {
     }
   });
   
+  module.exports = router;
