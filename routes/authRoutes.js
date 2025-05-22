@@ -1,87 +1,103 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const admin = require('firebase-admin');
 const User = require('../models/User');
 const router = express.Router();
 
-// Initialize Firebase Admin if not already done
+// Initialize Firebase if not already done
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert(require('../path/to/firebase-admin-sdk.json')),
     databaseURL: process.env.FIREBASE_DATABASE_URL
   });
 }
-
 const firestore = admin.firestore();
 
+// Error messages
 const authErrors = {
   missingFields: 'All fields are required',
-  userExists: 'User already exists',
+  invalidEmail: 'Please provide a valid email',
+  passwordLength: 'Password must be at least 8 characters',
+  userExists: 'Email already registered',
   invalidCredentials: 'Invalid email or password',
-  wrongUserType: 'Account type mismatch - please use the correct login form',
-  profileCreationFailed: 'Profile creation failed',
+  wrongUserType: 'Account type mismatch',
   registrationFailed: 'Registration failed',
   loginFailed: 'Login failed'
-};
-
-const sendError = (res, status, message) => {
-  return res.status(status).json({ success: false, message });
 };
 
 router.post('/register', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  
+
   try {
     const { name, email, password, userType } = req.body;
 
     // Validation
     if (!name || !email || !password || !userType) {
       await session.abortTransaction();
-      return sendError(res, 400, authErrors.missingFields);
+      return res.status(400).json({ 
+        success: false,
+        error: authErrors.missingFields,
+        missing: {
+          name: !name,
+          email: !email,
+          password: !password,
+          userType: !userType
+        }
+      });
     }
 
-    if (!['user', 'partner'].includes(userType)) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       await session.abortTransaction();
-      return sendError(res, 400, 'Invalid account type specified');
+      return res.status(400).json({
+        success: false,
+        error: authErrors.invalidEmail
+      });
+    }
+
+    if (password.length < 8) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        error: authErrors.passwordLength
+      });
     }
 
     // Check existing user
     const existingUser = await User.findOne({ email }).session(session);
     if (existingUser) {
       await session.abortTransaction();
-      return sendError(res, 400, authErrors.userExists);
+      return res.status(409).json({
+        success: false,
+        error: authErrors.userExists
+      });
     }
 
-    // Create auth record
+    // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
+
+    // Create user
     const user = new User({
       name,
       email,
       password: hashedPassword,
       userType
     });
-
     await user.save({ session });
 
     // Create Firestore profile
-    try {
-      await firestore.collection('users').doc(user._id.toString()).set({
-        name,
-        email,
-        userType,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastActive: admin.firestore.FieldValue.serverTimestamp(),
-        status: 'active'
-      }, { merge: true });
-    } catch (firestoreError) {
-      await session.abortTransaction();
-      console.error('Firestore profile creation failed:', firestoreError);
-      return sendError(res, 500, authErrors.profileCreationFailed);
-    }
+    await firestore.collection('users').doc(user._id.toString()).set({
+      name,
+      email,
+      userType,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastActive: admin.firestore.FieldValue.serverTimestamp(),
+      status: 'active'
+    });
 
-    // Generate JWT
+    // Generate token
     const token = jwt.sign(
       {
         userId: user._id,
@@ -105,7 +121,19 @@ router.post('/register', async (req, res) => {
   } catch (error) {
     await session.abortTransaction();
     console.error('Registration error:', error);
-    sendError(res, 500, authErrors.registrationFailed);
+    
+    let errorMessage = authErrors.registrationFailed;
+    if (error.name === 'ValidationError') {
+      errorMessage = Object.values(error.errors).map(e => e.message).join(', ');
+    } else if (error.code === 11000) {
+      errorMessage = authErrors.userExists;
+    }
+
+    res.status(500).json({
+      success: false,
+      error: errorMessage,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   } finally {
     session.endSession();
   }
@@ -115,43 +143,46 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password, userType } = req.body;
 
+    // Validation
     if (!email || !password || !userType) {
-      return sendError(res, 400, authErrors.missingFields);
+      return res.status(400).json({
+        success: false,
+        error: authErrors.missingFields
+      });
     }
 
+    // Find user
     const user = await User.findOne({ email });
     if (!user) {
-      return sendError(res, 401, authErrors.invalidCredentials);
+      return res.status(401).json({
+        success: false,
+        error: authErrors.invalidCredentials
+      });
     }
 
     // Verify user type
     if (user.userType !== userType) {
-      const userTypes = {
-        user: 'bathroom finder',
-        partner: 'bathroom host'
-      };
-      return sendError(res, 403,
-        `This account is for ${userTypes[user.userType]}. ` +
-        `Please use the ${userTypes[user.userType]} login.`
-      );
+      return res.status(403).json({
+        success: false,
+        error: `${authErrors.wrongUserType}. Please login as a ${user.userType}`
+      });
     }
 
     // Verify password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      return sendError(res, 401, authErrors.invalidCredentials);
-    }
-
-    // Update last login in Firestore
-    try {
-      await firestore.collection('users').doc(user._id.toString()).update({
-        lastActive: admin.firestore.FieldValue.serverTimestamp()
+      return res.status(401).json({
+        success: false,
+        error: authErrors.invalidCredentials
       });
-    } catch (firestoreError) {
-      console.error('Firestore update failed:', firestoreError);
     }
 
-    // Generate JWT
+    // Update last active
+    await firestore.collection('users').doc(user._id.toString()).update({
+      lastActive: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Generate token
     const token = jwt.sign(
       {
         userId: user._id,
@@ -172,21 +203,11 @@ router.post('/login', async (req, res) => {
 
   } catch (error) {
     console.error('Login error:', error);
-    sendError(res, 500, authErrors.loginFailed);
-  }
-});
-
-// Add this new endpoint for profile fetching
-router.get('/profile/:userId', async (req, res) => {
-  try {
-    const doc = await firestore.collection('users').doc(req.params.userId).get();
-    if (!doc.exists) {
-      return sendError(res, 404, 'Profile not found');
-    }
-    res.json({ success: true, profile: doc.data() });
-  } catch (error) {
-    console.error('Profile fetch error:', error);
-    sendError(res, 500, 'Failed to fetch profile');
+    res.status(500).json({
+      success: false,
+      error: authErrors.loginFailed,
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
