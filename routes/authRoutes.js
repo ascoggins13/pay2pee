@@ -22,11 +22,36 @@ const authErrors = {
   passwordLength: 'Password must be at least 8 characters',
   userExists: 'Email already registered',
   invalidCredentials: 'Invalid email or password',
-  wrongUserType: 'Account type mismatch',
+  wrongUserType: 'Account type mismatch. Please use the correct login type.',
   registrationFailed: 'Registration failed',
-  loginFailed: 'Login failed'
+  loginFailed: 'Login failed',
+  serverError: 'Something went wrong. Please try again.'
 };
 
+// Helper function to validate email format
+const isValidEmail = (email) => {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+};
+
+// Helper function to validate password length
+const isValidPassword = (password) => {
+  return password.length >= 8;
+};
+
+// Helper function to generate JWT token
+const generateToken = (user) => {
+  return jwt.sign(
+    {
+      userId: user._id,
+      userType: user.userType,
+      email: user.email
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+};
+
+// Register a new user
 router.post('/register', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -34,13 +59,12 @@ router.post('/register', async (req, res) => {
   try {
     const { name, email, password, userType } = req.body;
 
-    // Validation
+    // Validate required fields
     if (!name || !email || !password || !userType) {
-      await session.abortTransaction();
       return res.status(400).json({ 
         success: false,
         error: authErrors.missingFields,
-        missing: {
+        missingFields: {
           name: !name,
           email: !email,
           password: !password,
@@ -49,26 +73,25 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      await session.abortTransaction();
+    // Validate email format
+    if (!isValidEmail(email)) {
       return res.status(400).json({
         success: false,
         error: authErrors.invalidEmail
       });
     }
 
-    if (password.length < 8) {
-      await session.abortTransaction();
+    // Validate password length
+    if (!isValidPassword(password)) {
       return res.status(400).json({
         success: false,
         error: authErrors.passwordLength
       });
     }
 
-    // Check existing user
+    // Check if user already exists
     const existingUser = await User.findOne({ email }).session(session);
     if (existingUser) {
-      await session.abortTransaction();
       return res.status(409).json({
         success: false,
         error: authErrors.userExists
@@ -78,7 +101,7 @@ router.post('/register', async (req, res) => {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    // Create user
+    // Create user in MongoDB
     const user = new User({
       name,
       email,
@@ -97,20 +120,12 @@ router.post('/register', async (req, res) => {
       status: 'active'
     });
 
-    // Generate token
-    const token = jwt.sign(
-      {
-        userId: user._id,
-        userType: user.userType,
-        email: user.email
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    // Generate JWT token
+    const token = generateToken(user);
 
     await session.commitTransaction();
 
-    res.json({
+    res.status(201).json({
       success: true,
       token,
       userId: user._id,
@@ -139,11 +154,12 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// Login user
 router.post('/login', async (req, res) => {
   try {
     const { email, password, userType } = req.body;
 
-    // Validation
+    // Validate required fields
     if (!email || !password || !userType) {
       return res.status(400).json({
         success: false,
@@ -151,7 +167,7 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Find user
+    // Find user in MongoDB
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({
@@ -160,11 +176,12 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Verify user type
+    // Verify user type matches
     if (user.userType !== userType) {
       return res.status(403).json({
         success: false,
-        error: `${authErrors.wrongUserType}. Please login as a ${user.userType}`
+        error: authErrors.wrongUserType,
+        correctUserType: user.userType // Tell frontend the correct type
       });
     }
 
@@ -177,21 +194,13 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Update last active
+    // Update last active in Firestore
     await firestore.collection('users').doc(user._id.toString()).update({
       lastActive: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // Generate token
-    const token = jwt.sign(
-      {
-        userId: user._id,
-        userType: user.userType,
-        email: user.email
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    // Generate JWT token
+    const token = generateToken(user);
 
     res.json({
       success: true,
@@ -205,7 +214,7 @@ router.post('/login', async (req, res) => {
     console.error('Login error:', error);
     res.status(500).json({
       success: false,
-      error: authErrors.loginFailed,
+      error: authErrors.serverError,
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
