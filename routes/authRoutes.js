@@ -6,39 +6,50 @@ const admin = require('firebase-admin');
 const User = require('../models/User');
 const router = express.Router();
 
-// Initialize Firebase if not already done
+// ==================== INITIALIZATION ====================
+// Secure Firebase initialization
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(require('../path/to/firebase-admin-sdk.json')),
-    databaseURL: process.env.FIREBASE_DATABASE_URL
-  });
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(
+        JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+      ),
+      databaseURL: process.env.FIREBASE_DATABASE_URL
+    });
+  } catch (firebaseError) {
+    console.error('Firebase initialization failed:', firebaseError);
+    process.exit(1); // Critical failure
+  }
 }
 const firestore = admin.firestore();
+const saltRounds = parseInt(process.env.BCRYPT_SALT_ROUNDS) || 12;
 
-// Error messages
+// ==================== ERROR MESSAGES ====================
 const authErrors = {
   missingFields: 'All fields are required',
   invalidEmail: 'Please provide a valid email',
-  passwordLength: 'Password must be at least 8 characters',
+  passwordLength: `Password must be at least ${process.env.MIN_PASSWORD_LENGTH || 8} characters`,
   userExists: 'Email already registered',
   invalidCredentials: 'Invalid email or password',
   wrongUserType: 'Account type mismatch. Please use the correct login type.',
   registrationFailed: 'Registration failed',
   loginFailed: 'Login failed',
-  serverError: 'Something went wrong. Please try again.'
+  serverError: 'Something went wrong. Please try again.',
+  firestoreError: 'Failed to update user profile'
 };
 
-// Helper function to validate email format
-const isValidEmail = (email) => {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+// ==================== HELPER FUNCTIONS ====================
+const validateInputs = (email, password) => {
+  const errors = {};
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    errors.email = authErrors.invalidEmail;
+  }
+  if (password.length < (process.env.MIN_PASSWORD_LENGTH || 8)) {
+    errors.password = authErrors.passwordLength;
+  }
+  return errors;
 };
 
-// Helper function to validate password length
-const isValidPassword = (password) => {
-  return password.length >= 8;
-};
-
-// Helper function to generate JWT token
 const generateToken = (user) => {
   return jwt.sign(
     {
@@ -47,11 +58,12 @@ const generateToken = (user) => {
       email: user.email
     },
     process.env.JWT_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
 };
 
-// Register a new user
+// ==================== ROUTES ====================
+// -------------------- Registration --------------------
 router.post('/register', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -59,37 +71,31 @@ router.post('/register', async (req, res) => {
   try {
     const { name, email, password, userType } = req.body;
 
-    // Validate required fields
-    if (!name || !email || !password || !userType) {
-      return res.status(400).json({ 
+    // Validation
+    const missingFields = {};
+    if (!name) missingFields.name = 'Name is required';
+    if (!email) missingFields.email = 'Email is required';
+    if (!password) missingFields.password = 'Password is required';
+    if (!userType) missingFields.userType = 'Account type is required';
+
+    if (Object.keys(missingFields).length > 0) {
+      return res.status(400).json({
         success: false,
         error: authErrors.missingFields,
-        missingFields: {
-          name: !name,
-          email: !email,
-          password: !password,
-          userType: !userType
-        }
+        missingFields
       });
     }
 
-    // Validate email format
-    if (!isValidEmail(email)) {
+    const inputErrors = validateInputs(email, password);
+    if (Object.keys(inputErrors).length > 0) {
       return res.status(400).json({
         success: false,
-        error: authErrors.invalidEmail
+        error: 'Validation failed',
+        details: inputErrors
       });
     }
 
-    // Validate password length
-    if (!isValidPassword(password)) {
-      return res.status(400).json({
-        success: false,
-        error: authErrors.passwordLength
-      });
-    }
-
-    // Check if user already exists
+    // Check existing user
     const existingUser = await User.findOne({ email }).session(session);
     if (existingUser) {
       return res.status(409).json({
@@ -98,31 +104,34 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 12);
-
-    // Create user in MongoDB
+    // Create user
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
     const user = new User({
       name,
       email,
       password: hashedPassword,
       userType
     });
+
     await user.save({ session });
 
-    // Create Firestore profile
-    await firestore.collection('users').doc(user._id.toString()).set({
-      name,
-      email,
-      userType,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      lastActive: admin.firestore.FieldValue.serverTimestamp(),
-      status: 'active'
-    });
+    // Firebase profile creation (with error handling)
+    try {
+      await firestore.collection('users').doc(user._id.toString()).set({
+        name,
+        email,
+        userType,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastActive: admin.firestore.FieldValue.serverTimestamp(),
+        status: 'active'
+      });
+    } catch (firestoreError) {
+      console.error('Firestore error:', firestoreError);
+      throw new Error(authErrors.firestoreError);
+    }
 
-    // Generate JWT token
+    // Commit transaction
     const token = generateToken(user);
-
     await session.commitTransaction();
 
     res.status(201).json({
@@ -136,7 +145,7 @@ router.post('/register', async (req, res) => {
   } catch (error) {
     await session.abortTransaction();
     console.error('Registration error:', error);
-    
+
     let errorMessage = authErrors.registrationFailed;
     if (error.name === 'ValidationError') {
       errorMessage = Object.values(error.errors).map(e => e.message).join(', ');
@@ -154,21 +163,29 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// Login user
+// -------------------- Login --------------------
 router.post('/login', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { email, password, userType } = req.body;
 
-    // Validate required fields
+    // Validation
     if (!email || !password || !userType) {
       return res.status(400).json({
         success: false,
-        error: authErrors.missingFields
+        error: authErrors.missingFields,
+        missingFields: {
+          email: !email,
+          password: !password,
+          userType: !userType
+        }
       });
     }
 
-    // Find user in MongoDB
-    const user = await User.findOne({ email });
+    // Find user
+    const user = await User.findOne({ email }).session(session);
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -176,12 +193,12 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Verify user type matches
+    // Verify user type
     if (user.userType !== userType) {
       return res.status(403).json({
         success: false,
         error: authErrors.wrongUserType,
-        correctUserType: user.userType // Tell frontend the correct type
+        correctUserType: user.userType
       });
     }
 
@@ -194,13 +211,19 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Update last active in Firestore
-    await firestore.collection('users').doc(user._id.toString()).update({
-      lastActive: admin.firestore.FieldValue.serverTimestamp()
-    });
+    // Update Firestore
+    try {
+      await firestore.collection('users').doc(user._id.toString()).update({
+        lastActive: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } catch (firestoreError) {
+      console.error('Firestore update error:', firestoreError);
+      // Continue without failing the request
+    }
 
-    // Generate JWT token
+    // Generate token
     const token = generateToken(user);
+    await session.commitTransaction();
 
     res.json({
       success: true,
@@ -211,12 +234,16 @@ router.post('/login', async (req, res) => {
     });
 
   } catch (error) {
+    await session.abortTransaction();
     console.error('Login error:', error);
+
     res.status(500).json({
       success: false,
       error: authErrors.serverError,
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  } finally {
+    session.endSession();
   }
 });
 
