@@ -3,39 +3,84 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
-const path = require('path'); // Add this for static files
+const path = require('path');
 
 const app = express();
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ==================== CORS CONFIGURATION ====================
+const allowedOrigins = [
+  'https://pay2pee.app',
+  'http://localhost:3000' // For local development
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+// Apply CORS middleware
+app.use(cors(corsOptions));
+
+// Handle preflight requests
+app.options('*', cors(corsOptions));
+
+// ==================== SECURITY MIDDLEWARE ====================
 app.use(helmet());
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Database
+// ==================== DATABASE CONNECTION ====================
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// API Routes (MUST come before static files)
+// ==================== ROUTES ====================
 app.use('/api/locations', require('./routes/locations'));
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
 app.use('/stripe-webhooks', require('./routes/stripeWebhooksRoutes'));
 
-// ===== Add This Section =====
-// Serve static files from React (if in production)
+// ==================== STATIC FILES (PRODUCTION) ====================
 if (process.env.NODE_ENV === 'production') {
-  // 1. Set static folder
   app.use(express.static(path.join(__dirname, 'client/build')));
-
-  // 2. Handle React routing (return all requests to React app)
+  
   app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
   });
 }
-// ===========================
 
+// ==================== ERROR HANDLING ====================
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  
+  // Handle CORS errors
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ 
+      success: false,
+      error: 'Cross-origin request blocked'
+    });
+  }
+  
+  res.status(500).json({ 
+    success: false,
+    error: 'Internal server error' 
+  });
+});
+
+// ==================== SERVER START ====================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Allowed CORS origins: ${allowedOrigins.join(', ')}`);
+});
