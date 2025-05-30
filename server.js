@@ -39,7 +39,7 @@ mongoose.connect(process.env.MONGODB_URI)
 
 // ==================== ROUTES ====================
 app.use('/api/locations', require('./routes/locations'));
-app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/auth', require('./routes/auth'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
 app.use('/stripe-webhooks', require('./routes/stripeWebhooksRoutes'));
 
