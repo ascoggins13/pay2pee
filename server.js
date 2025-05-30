@@ -8,24 +8,23 @@ const path = require('path');
 const app = express();
 
 // ==================== CORS CONFIGURATION ====================
-const allowedOrigins = [
-  'https://pay2pee.app',
-  'http://localhost:3000' // For local development
-];
+const allowedOrigins = ['https://pay2pee.app', 'http://localhost:3000'];
 
 const corsOptions = {
-  origin: allowedOrigins,
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   optionsSuccessStatus: 200
 };
 
-// Apply CORS middleware
 app.use(cors(corsOptions));
-app.set('trust proxy', 1);
-
-// Handle preflight requests
 app.options('*', cors(corsOptions));
 
 // ==================== SECURITY MIDDLEWARE ====================
