@@ -46,6 +46,12 @@ mongoose.connect(process.env.MONGODB_URI, {
   process.exit(1);
 });
 
+app.use((req, res, next) => {
+  console.log('⏱️ Incoming Request:', req.method, req.url);
+  next();
+});
+
+
 // ==================== ROUTES ====================
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
