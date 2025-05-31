@@ -8,19 +8,21 @@ const router = express.Router();
 
 // ==================== INITIALIZATION ====================
 // Secure Firebase initialization
-if (!admin.apps.length) {
-  try {
+try {
+  if (!admin.apps.length) {
+    const serviceAccount = require('../serviceAccountKey.json');
+
     admin.initializeApp({
-      credential: admin.credential.cert(
-        JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-      ),
+      credential: admin.credential.cert(serviceAccount),
       databaseURL: process.env.FIREBASE_DATABASE_URL
     });
-  } catch (firebaseError) {
-    console.error('Firebase initialization failed:', firebaseError);
-    process.exit(1); // Critical failure
   }
+} catch (firebaseError) {
+  console.error('Firebase initialization failed:', firebaseError);
+  process.exit(1); // Critical failure
 }
+  
+
 const firestore = admin.firestore();
 const saltRounds = parseInt(process.env.BCRYPT_SALT_ROUNDS) || 12;
 
