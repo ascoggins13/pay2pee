@@ -59,7 +59,7 @@ app.use('/api/partners', require('./routes/partners'));
 app.use('/api/locations', require('./routes/locationRoutes'));
 app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
-app.use('/api/payments', require('./routes/payments'));
+app.use('/api/payments', require('./routes/paymentsRoutes'));
 
 // Optional: Serve static files if needed for Firebase Hosting fallback
 if (process.env.NODE_ENV === 'production') {

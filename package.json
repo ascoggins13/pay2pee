@@ -1,7 +1,7 @@
 {
   "name": "pay2pee-server",
   "scripts": {
-    "start": "node server/index.js",
+    "start": "node index.js",
     "dev": "nodemon index.js",
     "heroku-postbuild": "npm install"
   },
