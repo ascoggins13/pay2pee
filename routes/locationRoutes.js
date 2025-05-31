@@ -5,13 +5,7 @@ const auth = require('../middleware/auth');
 const { check, validationResult } = require('express-validator');
 const admin = require('firebase-admin');
 
-// Initialize Firebase if not already done
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(require('../path/to/firebase-admin-sdk.json')),
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET
-  });
-}
+
 
 // @route GET /api/locations/nearby
 // @desc Get active locations near coordinates
