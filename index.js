@@ -50,7 +50,8 @@ mongoose.connect(process.env.MONGODB_URI, {
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/partners', require('./routes/partners'));
-app.use('/api/locations', require('./routes/bathroomImageRoutes'));
+app.use('/api/locations', require('./routes/locationRoutes'));
+app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/payments'));
 

@@ -5,12 +5,7 @@ const upload = multer(); // For handling multipart/form-data
 
 const router = express.Router();
 
-// Fixed route - with proper spacing and clear parameter
-router.post(
-  '/bathrooms/:id/images', // Explicit parameter name
-  upload.single('image'), // Proper middleware formatting
-  addBathroomImage // Handler function
-);
+// Correct route: will map to /api/bathrooms/:id/images
+router.post('/:id/images', upload.single('image'), addBathroomImage);
 
 module.exports = router;
-
