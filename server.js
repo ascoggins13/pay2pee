@@ -4,7 +4,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const path = require('path');
-
 const app = express();
 
 // ==================== CORS CONFIGURATION ====================
@@ -34,19 +33,19 @@ app.use(express.urlencoded({ extended: true }));
 
 // ==================== DATABASE CONNECTION ====================
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
 
 // ==================== ROUTES ====================
-app.use('/api/locations', require('./routes/locations'));
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/payments', require('./routes/paymentsRoutes'));
-app.use('/stripe-webhooks', require('./routes/stripeWebhooksRoutes'));
+app.use('/api/locations', require('./routes/locationRoutes'));
+app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
+app.use('/api/partners', require('./routes/partnerRoutes'));
+app.use('/api/payments', require('./routes/paymentRoutes'));
+app.use('/api/webhooks/stripe', require('./routes/stripeWebhooksRoutes'));
 
 // ==================== STATIC FILES (PRODUCTION) ====================
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, 'client/build')));
-  
   app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
   });
@@ -55,24 +54,15 @@ if (process.env.NODE_ENV === 'production') {
 // ==================== ERROR HANDLING ====================
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  
-  // Handle CORS errors
   if (err.message === 'Not allowed by CORS') {
-    return res.status(403).json({ 
-      success: false,
-      error: 'Cross-origin request blocked'
-    });
+    return res.status(403).json({ success: false, error: 'Cross-origin request blocked' });
   }
-  
-  res.status(500).json({ 
-    success: false,
-    error: 'Internal server error' 
-  });
+  res.status(500).json({ success: false, error: 'Internal server error' });
 });
 
 // ==================== SERVER START ====================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Allowed CORS origins: ${allowedOrigins.join(', ')}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🌐 Allowed CORS origins: ${allowedOrigins.join(', ')}`);
 });
