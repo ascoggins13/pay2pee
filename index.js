@@ -29,7 +29,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Preflight
+app.options(cors(corsOptions)); // Preflight
 
 // ==================== MIDDLEWARE ====================
 app.use(express.json());
