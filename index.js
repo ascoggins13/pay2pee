@@ -50,16 +50,23 @@ app.use((req, res, next) => {
   console.log('⏱️ Incoming Request:', req.method, req.url);
   next();
 });
+// ==================== Test Route ====================
+app.get('/api/healthcheck', (req, res) => {
+  res.json({ 
+    status: 'healthy',
+    timestamp: new Date().toISOString()
+  });
+});
 
 
 // ==================== ROUTES ====================
 app.use('/api/auth', require('./routes/auth'));
-app.use('/api/users', require('./routes/users'));
-app.use('/api/partners', require('./routes/partners'));
-app.use('/api/locations', require('./routes/locationRoutes'));
-app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
-app.use('/api/subscriptions', require('./routes/subscriptions'));
-app.use('/api/payments', require('./routes/paymentsRoutes'));
+//app.use('/api/users', require('./routes/users'));
+//app.use('/api/partners', require('./routes/partners'));
+//app.use('/api/locations', require('./routes/locationRoutes'));
+//app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
+//app.use('/api/subscriptions', require('./routes/subscriptions'));
+//app.use('/api/payments', require('./routes/paymentsRoutes'));
 
 // Optional: Serve static files if needed for Firebase Hosting fallback
 if (process.env.NODE_ENV === 'production') {
