@@ -6,78 +6,142 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const path = require('path');
 
+// Initialize Express app
 const app = express();
 
-// ==================== FIREBASE ADMIN INITIALIZATION ====================
-const serviceAccount = require('./serviceAccountKey.json');
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-// ==================== CORS CONFIGURATION ====================
-const allowedOrigins = [
-  'https://pay2pee.app',
-  'http://localhost:3000' // For local testing
-];
-
-const corsOptions = {
-  origin: allowedOrigins,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  optionsSuccessStatus: 200
-};
-
-app.use(cors(corsOptions));
-app.options(cors(corsOptions)); // Preflight
-
-// ==================== MIDDLEWARE ====================
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// ==================== DATABASE CONNECTION ====================
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-})
-.then(() => console.log('✅ Connected to MongoDB'))
-.catch(err => {
-  console.error('❌ MongoDB connection error:', err);
+// ==================== ENHANCED ERROR HANDLING ====================
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
   process.exit(1);
 });
 
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+});
+
+// ==================== FIREBASE ADMIN INITIALIZATION ====================
+try {
+  const serviceAccount = require('./serviceAccountKey.json');
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: process.env.FIREBASE_DATABASE_URL || 'https://pay2pee-default-rtdb.firebaseio.com'
+  });
+  console.log('✅ Firebase Admin initialized');
+} catch (firebaseError) {
+  console.error('❌ Firebase initialization failed:', firebaseError);
+  process.exit(1);
+}
+
+// ==================== SECURITY MIDDLEWARE ====================
+// Enhanced CORS configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'https://pay2pee.app',
+      'http://localhost:3000'
+    ];
+    
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+app.use(cors(corsOptions));
+
+// Trust Heroku proxy
+app.set('trust proxy', 1);
+
+// Body parser middleware with limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ==================== DATABASE CONNECTION ====================
+const connectWithRetry = () => {
+  mongoose.connect(process.env.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    retryWrites: true,
+    w: 'majority'
+  })
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err);
+    setTimeout(connectWithRetry, 5000);
+  });
+};
+
+connectWithRetry();
+
+// ==================== REQUEST LOGGING ====================
 app.use((req, res, next) => {
-  console.log('⏱️ Incoming Request:', req.method, req.url);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
-// ==================== Test Route ====================
+
+// ==================== ROUTES ====================
+// Health Check
 app.get('/api/healthcheck', (req, res) => {
   res.json({ 
     status: 'healthy',
-    timestamp: new Date().toISOString()
+    serverTime: new Date().toISOString(),
+    dbStatus: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected'
   });
 });
 
-
-// ==================== ROUTES ====================
+// API Routes
 app.use('/api/auth', require('./routes/auth'));
-//app.use('/api/users', require('./routes/users'));
-//app.use('/api/partners', require('./routes/partners'));
-//app.use('/api/locations', require('./routes/locationRoutes'));
-//app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
-//app.use('/api/subscriptions', require('./routes/subscriptions'));
-//app.use('/api/payments', require('./routes/paymentsRoutes'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/partners', require('./routes/partnerRoutes'));
+app.use('/api/locations', require('./routes/locationRoutes'));
+app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
+app.use('/api/subscriptions', require('./routes/subscriptions'));
+app.use('/api/payments', require('./routes/paymentsRoutes'));
 
-// Optional: Serve static files if needed for Firebase Hosting fallback
+// ==================== PRODUCTION CONFIG ====================
 if (process.env.NODE_ENV === 'production') {
+  // Serve static files
   app.use(express.static(path.join(__dirname, 'client/build')));
-  app.get('*', (req, res) =>
-    res.sendFile(path.join(__dirname, 'client/build', 'index.html'))
-  );
+
+  // Handle React routing
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
+  });
 }
+
+// ==================== ERROR HANDLING ====================
+// 404 Handler
+app.use((req, res, next) => {
+  res.status(404).json({ success: false, error: 'Endpoint not found' });
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error('⚠️ Server Error:', err.stack);
+  res.status(500).json({ 
+    success: false,
+    error: process.env.NODE_ENV === 'development' ? err.message : 'Server error'
+  });
+});
 
 // ==================== SERVER START ====================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Process terminated');
+  });
 });

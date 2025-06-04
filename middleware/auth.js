@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { auth } = require('firebase-admin');
 
 exports.protect = async (req, res, next) => {
   let token;
@@ -25,3 +26,4 @@ exports.restrictTo = (...roles) => {
     next();
   };
 }
+module.exports = auth;
