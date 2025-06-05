@@ -1,39 +1,13 @@
 {
   "name": "pay2pee-server",
+  "version": "1.0.0",
+  "private": true,
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "heroku-postbuild": "npm install --production && npm cache clean --force"
-  },
-  "dependencies": {
-    "bcryptjs": "2.4.3",
-    "body-parser": "1.19.2",
-    "cors": "2.8.5",
-    "debug": "^4.3.4",
-    "depd": "2.0.0",
-    "dotenv": "16.0.3",
-    "express": "4.18.2",
-    "express-validator": "6.14.3",
-    "firebase-admin": "11.11.0",
-    "mongoose": "6.11.3",
-    "path-to-regexp": "6.2.0",
-    "router": "1.3.8",
-    "stripe": "14.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "2.0.20"
+    "start": "cd server && node index.js",
+    "heroku-postbuild": "echo 'Skipping client build - hosted on Firebase'"
   },
   "engines": {
-    "node": "18.x",
-    "npm": "9.x"
-  },
-  "resolutions": {
-    "express": "4.18.2",
-    "router": "1.3.8"
-  },
-  "overrides": {
-    "express": {
-      "router": "1.3.8"
-    }
+    "node": "16.x",
+    "npm": "8.x"
   }
 }
