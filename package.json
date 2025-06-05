@@ -9,7 +9,7 @@
     "bcryptjs": "2.4.3",
     "cors": "2.8.5",
     "dotenv": "16.0.3",
-    "express": "4.17.3",
+    "express": "4.18.2",
     "express-validator": "6.14.3",
     "firebase-admin": "11.11.0",
     "mongoose": "6.11.3",
@@ -26,5 +26,14 @@
   "engines": {
     "node": "16.x",
     "npm": "8.19.4"
+  },
+  "resolutions": {
+    "express": "4.18.2",
+    "router": "1.3.8"
+  },
+  "overrides": {
+    "express": {
+      "router": "1.3.8"
+    }
   }
 }
