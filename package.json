@@ -1,13 +1,15 @@
 {
-  "name": "pay2pee-server",
+  "name": "pay2pee",
   "version": "1.0.0",
-  "private": true,
+  "description": "Pay2Pee Backend",
+  "main": "server/index.js",
   "scripts": {
-    "start": "cd server && node index.js",
-    "heroku-postbuild": "echo 'Skipping client build - hosted on Firebase'"
+    "start": "node server/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {
-    "node": "16.x",
-    "npm": "8.x"
-  }
+    "node": "16.x"
+  },
+  "author": "",
+  "license": "ISC"
 }
