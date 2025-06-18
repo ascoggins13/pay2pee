@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const auth = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 const stripeService = require('../services/stripeService');
 const PartnerModel = require('../models/Partner');
 
@@ -11,7 +11,7 @@ const PartnerModel = require('../models/Partner');
  * @body {email: string, partnerId: string}
  * @returns {accountId: string, onboardingLink: string}
  */
-router.post('/onboard-partner', auth, async (req, res) => {
+router.post('/onboard-partner', protect, async (req, res) => {
   try {
     const { email, partnerId } = req.body;
     
