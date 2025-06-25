@@ -1,21 +1,17 @@
 {
   "name": "pay2pee",
   "version": "1.0.0",
-  "description": "Pay2Pee Backend",
-  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "heroku-postbuild": "npm install --force --legacy-peer-deps",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "clean-install": "rm -rf node_modules package-lock.json && npm install --legacy-peer-deps"
+    "clean-install": "rm -rf node_modules package-lock.json && npm install --legacy-peer-deps",
+    "postinstall": "if [ ! -f node_modules/iconv-lite/lib/extend-node.js ]; then mkdir -p node_modules/iconv-lite/lib && echo '\"use strict\"; ...(content from above)...' > node_modules/iconv-lite/lib/extend-node.js; fi"
   },
   "engines": {
     "node": "18.20.2",
-    "npm": "8.19.4"
+    "npm": "9.x"
   },
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "bcryptjs": "2.4.3",
     "body-parser": "1.20.2",
@@ -25,7 +21,7 @@
     "express": "4.18.2",
     "express-validator": "7.2.1",
     "firebase-admin": "13.4.0",
-    "iconv-lite": "0.6.3",
+    "iconv-lite": "^0.6.3",
     "jsonwebtoken": "9.0.2",
     "mongoose": "8.16.0",
     "morgan": "1.10.0",
@@ -34,8 +30,5 @@
   },
   "devDependencies": {
     "nodemon": "3.1.0"
-  },
-  "resolutions": {
-    "iconv-lite": "0.6.3"
   }
 }
