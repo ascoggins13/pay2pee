@@ -4,35 +4,38 @@
   "description": "Pay2Pee Backend",
   "main": "index.js",
   "scripts": {
-    "preinstall": "npx npm-force-resolutions",
     "start": "node index.js",
-    "heroku-prebuild": "npm install -g npm@8.19.4",
-    "heroku-postbuild": "npm install express@4.18.2 --force && npm install path-to-regexp@6.2.1 --no-save --prefix node_modules/express",
+    "heroku-postbuild": "npm install --force --legacy-peer-deps",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clean-install": "rm -rf node_modules package-lock.json && npm install --legacy-peer-deps"
   },
   "engines": {
-    "node": "18.20.2"
+    "node": "18.20.2",
+    "npm": "8.19.4"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
-    "debug": "^4.3.4",
-    "dotenv": "^16.5.0",
-    "express": "^4.18.2",
-    "express-validator": "^7.2.1",
-    "firebase-admin": "^13.4.0",
-    "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.16.0",
-    "morgan": "^1.10.0",
-    "path-to-regexp": "^6.2.1",
-    "stripe": "^18.2.1",
-    "npm-force-resolutions": "^0.0.3"
+    "bcryptjs": "2.4.3",
+    "body-parser": "1.20.2",
+    "cors": "2.8.5",
+    "debug": "4.3.4",
+    "dotenv": "16.5.0",
+    "express": "4.18.2",
+    "express-validator": "7.2.1",
+    "firebase-admin": "13.4.0",
+    "iconv-lite": "0.6.3",
+    "jsonwebtoken": "9.0.2",
+    "mongoose": "8.16.0",
+    "morgan": "1.10.0",
+    "path-to-regexp": "6.2.1",
+    "stripe": "18.2.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "3.1.0"
+  },
+  "resolutions": {
+    "iconv-lite": "0.6.3"
   }
 }
