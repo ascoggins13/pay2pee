@@ -30,6 +30,14 @@ try {
 } catch (firebaseError) {
   console.error('❌ Firebase initialization failed:', firebaseError);
 }
+console.log('Module paths:', require('module')._paths);
+console.log('Trying to require router...');
+try {
+  const router = require('./node_modules/express/lib/router');
+  console.log('Successfully required router!');
+} catch (err) {
+  console.error('Require error:', err);
+}
 
 // ==================== MIDDLEWARE ====================
 // Enhanced CORS configuration
