@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "heroku-prebuild": "npm install -g npm@8.19.4",
-  "heroku-postbuild": "npm install path-to-regexp@1.7.0 && npm rebuild",
+    "heroku-postbuild": "npm install express@4.18.2 --force && npm install path-to-regexp@6.2.1 --no-save --prefix node_modules/express",
     "dev": "nodemon index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -27,8 +27,8 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.16.0",
     "morgan": "^1.10.0",
-    "stripe": "^18.2.1",
-    "path-to-regexp": "^6.2.1"
+    "path-to-regexp": "^6.2.1",
+    "stripe": "^18.2.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
