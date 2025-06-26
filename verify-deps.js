@@ -1,42 +1,52 @@
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
-// Check for express router files
-const expressRouterPath = path.join('node_modules', 'express', 'lib', 'router');
-if (!fs.existsSync(expressRouterPath)) {
-  console.error('Express router files missing! Reinstalling express...');
-  require('child_process').execSync('npm install express@4.18.2 --force', {stdio: 'inherit'});
-}
+const dependenciesToVerify = [
+  {
+    name: 'express',
+    files: [
+      'lib/router/index.js',
+      'lib/router/layer.js',
+      'lib/router/route.js'
+    ]
+  },
+  {
+    name: 'iconv-lite',
+    files: [
+      'lib/extend-node.js'
+    ]
+  },
+  {
+    name: 'mongoose',
+    files: [
+      'lib/drivers/node-mongodb-native/bulkWriteResult.js',
+      'lib/drivers/node-mongodb-native/collection.js'
+    ]
+  }
+];
 
-// Check for iconv-lite file
-const iconvLitePath = path.join('node_modules', 'iconv-lite', 'lib', 'extend-node.js');
-if (!fs.existsSync(iconvLitePath)) {
-  console.error('iconv-lite extend-node.js missing! Reinstalling iconv-lite...');
-  require('child_process').execSync('npm install iconv-lite@0.6.3 --force', {stdio: 'inherit'});
+function verifyDependency(dep) {
+  let allFilesExist = true;
   
-  // If still missing, create it manually
-  if (!fs.existsSync(iconvLitePath)) {
-    const content = `"use strict";
-// Prepare to extend Node's primitive String.prototype with a \`toByteArray\` method
-// and Buffer.prototype with \`toString\` method that support all encodings.
-var Buffer = require('safer-buffer').Buffer;
-// String.prototype augmentation.
-if (String.prototype.toByteArray) {
-    delete String.prototype.toByteArray;
-}
-String.prototype.toByteArray = function(encoding) {
-    return Buffer.from(this, encoding);
-};
-// Buffer.prototype augmentation.
-if (Buffer.prototype.toString) {
-    delete Buffer.prototype.toString;
-}
-Buffer.prototype.toString = function(encoding) {
-    return this.toString(encoding);
-};`;
-    fs.mkdirSync(path.dirname(iconvLitePath), { recursive: true });
-    fs.writeFileSync(iconvLitePath, content);
+  dep.files.forEach(file => {
+    const fullPath = path.join('node_modules', dep.name, file);
+    if (!fs.existsSync(fullPath)) {
+      console.error(`Missing file: ${fullPath}`);
+      allFilesExist = false;
+    }
+  });
+
+  if (!allFilesExist) {
+    console.log(`Reinstalling ${dep.name}...`);
+    try {
+      execSync(`npm install ${dep.name}@${require('./package.json').dependencies[dep.name]} --force`, { stdio: 'inherit' });
+    } catch (err) {
+      console.error(`Failed to reinstall ${dep.name}:`, err);
+    }
   }
 }
 
+console.log('Verifying all critical dependencies...');
+dependenciesToVerify.forEach(verifyDependency);
 console.log('Dependency verification complete');
