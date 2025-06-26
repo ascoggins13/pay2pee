@@ -2,12 +2,12 @@
   "name": "pay2pee",
   "version": "1.0.0",
   "scripts": {
-    "start": "node index.js",
+    "start": "node verify-deps.js && node index.js",
     "heroku-postbuild": "npm install --production --force && npm rebuild",
     "verify-deps": "node verify-deps.js",
     "dev": "nodemon index.js",
     "clean-install": "rm -rf node_modules package-lock.json && npm install",
-    "postinstall": "if [ ! -d \"node_modules/express/lib/router\" ]; then npm install express@4.18.2 --force || (curl -L https://github.com/expressjs/express/archive/4.18.2.tar.gz | tar xz && mv express-4.18.2 node_modules/express && rm -rf express-4.18.2); fi"
+    "postinstall": "node verify-deps.js"
   },
   "engines": {
     "node": "18.20.2",

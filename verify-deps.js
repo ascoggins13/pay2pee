@@ -2,51 +2,22 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const dependenciesToVerify = [
-  {
-    name: 'express',
-    files: [
-      'lib/router/index.js',
-      'lib/router/layer.js',
-      'lib/router/route.js'
-    ]
-  },
-  {
-    name: 'iconv-lite',
-    files: [
-      'lib/extend-node.js'
-    ]
-  },
-  {
-    name: 'mongoose',
-    files: [
-      'lib/drivers/node-mongodb-native/bulkWriteResult.js',
-      'lib/drivers/node-mongodb-native/collection.js'
-    ]
-  }
-];
+const criticalFiles = {
+  mongoose: 'lib/drivers/node-mongodb-native/bulkWriteResult.js',
+  'iconv-lite': 'lib/extend-node.js'
+};
 
-function verifyDependency(dep) {
-  let allFilesExist = true;
-  
-  dep.files.forEach(file => {
-    const fullPath = path.join('node_modules', dep.name, file);
-    if (!fs.existsSync(fullPath)) {
-      console.error(`Missing file: ${fullPath}`);
-      allFilesExist = false;
-    }
-  });
-
-  if (!allFilesExist) {
-    console.log(`Reinstalling ${dep.name}...`);
+Object.entries(criticalFiles).forEach(([pkg, filePath]) => {
+  const fullPath = path.join('node_modules', pkg, filePath);
+  if (!fs.existsSync(fullPath)) {
+    console.error(`Missing ${fullPath}`);
+    console.log(`Attempting to download ${pkg} file...`);
     try {
-      execSync(`npm install ${dep.name}@${require('./package.json').dependencies[dep.name]} --force`, { stdio: 'inherit' });
+      execSync(`mkdir -p ${path.dirname(fullPath)}`);
+      execSync(`curl -o ${fullPath} https://raw.githubusercontent.com/${pkg === 'mongoose' ? 'Automattic/mongoose' : 'ashtuchkin/iconv-lite'}/${require('./package.json').dependencies[pkg]}/${filePath}`);
     } catch (err) {
-      console.error(`Failed to reinstall ${dep.name}:`, err);
+      console.error(`Failed to restore ${fullPath}:`, err);
+      process.exit(1);
     }
   }
-}
-
-console.log('Verifying all critical dependencies...');
-dependenciesToVerify.forEach(verifyDependency);
-console.log('Dependency verification complete');
+});
