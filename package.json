@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "scripts": {
     "start": "node index.js",
-    "heroku-postbuild": "npm install --force --legacy-peer-deps",
+    "heroku-postbuild": "npm install --production --force && npm install express@4.18.2 --force && npm install iconv-lite@0.6.3 --force",
     "dev": "nodemon index.js",
-    "clean-install": "rm -rf node_modules package-lock.json && npm install --legacy-peer-deps",
-    "postinstall": "if [ ! -f node_modules/iconv-lite/lib/extend-node.js ]; then mkdir -p node_modules/iconv-lite/lib && echo '\"use strict\"; ...(content from above)...' > node_modules/iconv-lite/lib/extend-node.js; fi"
+    "postinstall": "node verify-deps.js",
+    "clean-install": "rm -rf node_modules package-lock.json && npm install"
   },
   "engines": {
     "node": "18.20.2",
@@ -18,7 +18,7 @@
     "cors": "2.8.5",
     "debug": "4.3.4",
     "dotenv": "16.5.0",
-    "express": "^4.18.2",
+    "express": "4.18.2",
     "express-validator": "7.2.1",
     "firebase-admin": "13.4.0",
     "iconv-lite": "^0.6.3",
