@@ -1,75 +1,155 @@
+c// routes/auth.js (Firestore-only)
+// Endpoints:
+//   POST /auth/register
+//   POST /auth/login
+//
+// Returns (success path, both routes):
+//   { success: true, token, userId, userType, name }
+//
+// Notes:
+// - No Mongo/Mongoose required.
+// - Hashing happens ONLY on the server (bcrypt).
+// - Uses Firebase Admin SDK Firestore as the source of truth.
+// - Keeps your "wrong account type" behavior with { correctUserType } on 403.
+
+const express = require('express');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const { auth: firebaseAuth } = require('firebase-admin');
+const admin = require('firebase-admin');
 
-// Verify JWT token and protect routes
-const protect = async (req, res, next) => {
-  let token;
-  
-  // Get token from header
-  if (req.headers.authorization?.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  }
-  
-  if (!token) {
-    return res.status(401).json({ message: 'Not authorized, no token' });
-  }
+const router = express.Router();
 
+// Ensure Firebase Admin is initialized somewhere once in your app.
+// If not, this will initialize with default credentials/environment.
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+const firestore = admin.firestore();
+const usersCol = firestore.collection('users');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const SALT_ROUNDS = 10;
+
+// Helpers
+const normalizeEmail = (e) => (e || '').trim().toLowerCase();
+const now = () => admin.firestore.FieldValue.serverTimestamp();
+
+// Issue a JWT with your standard claims
+function issueJwt({ userId, email, userType }) {
+  return jwt.sign({ userId, email, userType }, JWT_SECRET, { expiresIn: '7d' });
+}
+
+// Shape the success payload exactly like your frontend expects
+function successAuthPayload({ id, name, userType, email }) {
+  const token = issueJwt({ userId: id, email, userType });
+  return { success: true, token, userId: id, userType, name };
+}
+
+// --- POST /auth/register ---
+router.post('/register', async (req, res) => {
   try {
-    // Verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Get user from database
-    req.user = await User.findById(decoded.id).select('-password');
-    
-    if (!req.user) {
-      return res.status(401).json({ message: 'User not found' });
-    }
-    
-    next();
-  } catch (err) {
-    console.error('Token verification error:', err);
-    res.status(401).json({ message: 'Invalid token' });
-  }
-};
+    const { name, email, password, userType } = req.body || {};
 
-// Role-based authorization
-const restrictTo = (...roles) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({ message: 'Not authenticated' });
+    if (!name || !email || !password || !userType) {
+      return res.status(400).json({ success: false, error: 'Missing fields' });
     }
-    
-    if (!roles.includes(req.user.userType)) {
-      return res.status(403).json({ 
-        message: `Access denied. Required roles: ${roles.join(', ')}`
+    const emailNorm = normalizeEmail(email);
+    const typeNorm = String(userType).toLowerCase();
+    if (!['user', 'partner'].includes(typeNorm)) {
+      return res.status(400).json({ success: false, error: 'Invalid userType' });
+    }
+
+    // Check for existing user by email (lowercased)
+    const existingSnap = await usersCol.where('emailLower', '==', emailNorm).limit(1).get();
+    if (!existingSnap.empty) {
+      return res.status(409).json({ success: false, error: 'Email already registered' });
+    }
+
+    // Hash password (DO NOT hash on the client)
+    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
+    // Create Firestore doc
+    const docRef = usersCol.doc(); // auto id
+    await docRef.set({
+      name: name.trim(),
+      email: email.trim(),
+      emailLower: emailNorm,
+      userType: typeNorm,              // 'user' | 'partner'
+      passwordHash,                    // secure hash
+      status: 'active',
+      createdAt: now(),
+      lastActive: now(),
+    });
+
+    // Success payload
+    return res.json(
+      successAuthPayload({
+        id: docRef.id,
+        name: name.trim(),
+        userType: typeNorm,
+        email: emailNorm,
+      })
+    );
+  } catch (err) {
+    console.error('REGISTER error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// --- POST /auth/login ---
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password, userType } = req.body || {};
+    if (!email || !password || !userType) {
+      return res.status(400).json({ success: false, error: 'Missing fields' });
+    }
+
+    const emailNorm = normalizeEmail(email);
+    const typeAttempt = String(userType).toLowerCase();
+
+    // Lookup by emailLower
+    const snap = await usersCol.where('emailLower', '==', emailNorm).limit(1).get();
+    if (snap.empty) {
+      // Avoid leaking existence: generic invalid creds
+      return res.status(401).json({ success: false, error: 'Invalid email or password' });
+    }
+
+    const doc = snap.docs[0];
+    const user = { id: doc.id, ...doc.data() };
+
+    // Enforce correct userType (keeps your previous behavior)
+    if (user.userType !== typeAttempt) {
+      return res.status(403).json({
+        success: false,
+        error: 'Account type mismatch. Please log in with the correct account type.',
+        correctUserType: user.userType, // 'user' or 'partner'
       });
     }
-    
-    next();
-  };
-};
 
-// Firebase authentication middleware
-const firebaseProtect = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
-      return res.status(401).json({ message: 'Unauthorized' });
+    // Compare password
+    const ok = await bcrypt.compare(password, user.passwordHash || '');
+    if (!ok) {
+      return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    const token = authHeader.split(' ')[1];
-    const decodedToken = await firebaseAuth().verifyIdToken(token);
-    req.firebaseUser = decodedToken;
-    next();
-  } catch (err) {
-    console.error('Firebase auth error:', err);
-    res.status(401).json({ message: 'Invalid Firebase token' });
-  }
-};
+    // Update lastActive (fire-and-forget)
+    doc.ref.update({ lastActive: now() }).catch((e) => {
+      console.warn('lastActive update failed:', e?.message || e);
+    });
 
-module.exports = {
-  protect,
-  restrictTo,
-  firebaseProtect
-};
+    // Success payload
+    return res.json(
+      successAuthPayload({
+        id: user.id,
+        name: user.name || '',
+        userType: user.userType,
+        email: emailNorm,
+      })
+    );
+  } catch (err) {
+    console.error('LOGIN error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+module.exports = router;

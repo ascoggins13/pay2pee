@@ -2,14 +2,13 @@
 const { bucket } = require('../firebase-admin');
 
 module.exports = {
-  /**
-   * Uploads a bathroom image to Firebase Storage and returns its public URL.
-   *
-   * @param {Buffer} fileBuffer - The image buffer from multer
-   * @param {string} fileName - Name to store the file as
-   * @param {string} contentType - MIME type (e.g., image/jpeg, image/png)
-   * @returns {Promise<string>} - Public URL of the uploaded image
-   */
+  async uploadBathroomImage(fileBuffer, fileName, contentType = 'image/jpeg') {
+    const file = bucket.file(`bathrooms/${fileName}`);
+    await file.save(fileBuffer, { metadata: { contentType }, resumable: false });
+    await file.makePublic();
+    return file.publicUrl();
+  },
+
   uploadBathroomImage: async (fileBuffer, fileName, contentType = 'image/jpeg') => {
     try {
       const file = bucket.file(`bathrooms/${fileName}`);

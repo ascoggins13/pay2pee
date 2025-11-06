@@ -1,54 +1,185 @@
+// routes/partnerRoutes.js
 const express = require('express');
-const router = express.Router();
-const { protect } = require('../middleware/auth');
+const { body, validationResult } = require('express-validator');
+
+const protect = require('../middleware/protect');
+const { admin, firestore } = require('../firebase-admin');
 const stripeService = require('../services/stripeService');
-const PartnerModel = require('../models/Partner');
+
+const usersCol = firestore.collection('users');
+const partnersCol = firestore.collection('partners');
+const locationsCol = firestore.collection('locations');
+
+// ─────────────────────────────────────────────────────────────
+// Partner router -> /api/partner/*
+// ─────────────────────────────────────────────────────────────
+const partnerRouter = express.Router();
 
 /**
- * @route POST /api/partners/onboard-partner
- * @desc Onboard a new partner with Stripe Connect
- * @access Private
- * @body {email: string, partnerId: string}
- * @returns {accountId: string, onboardingLink: string}
+ * GET /api/partner/summary
+ * Returns dashboard data for the currently logged-in partner.
  */
-router.post('/onboard-partner', protect, async (req, res) => {
+partnerRouter.get('/summary', protect, async (req, res) => {
   try {
-    const { email, partnerId } = req.body;
-    
-    // Input validation
-    if (!email || !partnerId) {
-      return res.status(400).json({ error: 'Email and partnerId are required' });
-    }
+    const userId = req.user.userId;
 
-    // 1. Create Stripe Connected Account
-    const account = await stripeService.createPartnerAccount(email, partnerId);
-    
-    // 2. Save Stripe account ID to database
-    const updatedPartner = await PartnerModel.findByIdAndUpdate(
-      partnerId,
-      {
-        stripeAccountId: account.id,
-        onboardingStatus: 'pending_verification'
+    // Find partner (optional, if you keep a partners collection)
+    const partnerDoc = await partnersCol.doc(userId).get();
+    const partner = partnerDoc.exists ? partnerDoc.data() : {};
+
+    // Find location owned by this partner
+    const locSnap = await locationsCol.where('owner', '==', userId).limit(1).get();
+    const hasLocation = !locSnap.empty;
+    const locRef = hasLocation ? locSnap.docs[0].ref : null;
+    const loc = hasLocation ? locSnap.docs[0].data() : null;
+
+    // Compose summary (match what your UI expects)
+    const data = {
+      name: loc?.name || partner?.businessName || 'My Location',
+      address: loc?.address || partner?.businessAddress || '—',
+      isActive: Boolean(loc?.isActive),
+      todayVisits: Number(loc?.todayVisits || 0),
+      currentBalance: Number(partner?.pendingPayout || 0),
+      lastPayoutDate: partner?.lastPayoutDate || null,
+      rating: loc?.rating?.average ?? 4.8,
+      reviews: Array.isArray(loc?.recentReviews) ? loc.recentReviews : [],
+      trafficByDay: loc?.trafficByDay || {
+        Monday: 0, Tuesday: 0, Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0, Sunday: 0
       },
-      { new: true }
-    );
+      activeGuests: Array.isArray(loc?.activeGuests) ? loc.activeGuests : [],
+      locationDetails: {
+        price: Number(loc?.pricing?.basePrice || 0),
+        accessCode: loc?.accessCode || '—',
+        hours: loc?.hours || '—',
+        features: Array.isArray(loc?.amenities) ? loc.amenities : [],
+        photos: Array.isArray(loc?.photos) ? loc.photos.map(p => p.url || p) : [],
+      },
+      ownerName: partner?.ownerName || req.user.email?.split('@')[0] || 'Partner',
+      avatarUrl: partner?.avatarUrl || '',
+    };
 
-    if (!updatedPartner) {
-      return res.status(404).json({ error: 'Partner not found' });
-    }
-
-    res.json({ 
-      success: true,
-      accountId: account.id,
-      onboardingLink: account.onboarding?.url // For identity verification
-    });
+    return res.json(data);
   } catch (err) {
-    console.error('Partner onboarding error:', err);
-    res.status(500).json({ 
-      success: false,
-      error: err.message || 'Partner onboarding failed' 
-    });
+    console.error('GET /partner/summary error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
-module.exports = router;
+/**
+ * POST /api/partner/onboard
+ * Creates/links a Stripe Connect account for payouts (protected).
+ * Optional body fields for KYC bootstrap.
+ */
+partnerRouter.post(
+  '/onboard',
+  protect,
+  [
+    body('email').optional().isEmail(),
+    body('firstName').optional().isString(),
+    body('lastName').optional().isString(),
+    body('ssnLast4').optional().isString(),
+    body('dobDay').optional().isInt({ min: 1, max: 31 }),
+    body('dobMonth').optional().isInt({ min: 1, max: 12 }),
+    body('dobYear').optional().isInt({ min: 1900 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const userId = req.user.userId;
+
+      // get email from users collection if not provided
+      let email = req.body.email;
+      if (!email) {
+        const userDoc = await usersCol.doc(userId).get();
+        email = userDoc.exists ? userDoc.data().email : null;
+      }
+      if (!email) return res.status(400).json({ error: 'Email required' });
+
+      const account = await stripeService.createPartnerAccount(userId, email, req.body);
+
+      // persist on partners/{userId}
+      await partnersCol.doc(userId).set(
+        { stripeAccountId: account.id, onboardingStatus: 'pending_verification' },
+        { merge: true }
+      );
+
+      return res.json({ success: true, stripeAccountId: account.id });
+    } catch (err) {
+      console.error('POST /partner/onboard error:', err);
+      return res.status(500).json({ error: err.message || 'Stripe error' });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// Host router -> /api/host/*    (simple aliases used by your UI)
+// ─────────────────────────────────────────────────────────────
+const hostRouter = express.Router();
+
+/**
+ * PUT /api/host/visibility
+ * Toggle partner listing active/pause.
+ */
+hostRouter.put(
+  '/visibility',
+  protect,
+  [body('isActive').isBoolean()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const userId = req.user.userId;
+      const snap = await locationsCol.where('owner', '==', userId).limit(1).get();
+      if (snap.empty) return res.status(404).json({ error: 'Location not found' });
+
+      const ref = snap.docs[0].ref;
+      await ref.set({ isActive: req.body.isActive }, { merge: true });
+
+      const updated = await ref.get();
+      return res.json({ id: ref.id, ...updated.data() });
+    } catch (err) {
+      console.error('PUT /host/visibility error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  }
+);
+
+/**
+ * POST /api/host/payout
+ * Trigger a manual payout of the partner's pending balance.
+ */
+hostRouter.post(
+  '/payout',
+  protect,
+  [body('amountRequested').isFloat({ min: 5 })],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const partnerId = req.user.userId;
+      const amount = Number(req.body.amountRequested);
+
+      // Stripe transfer to connected account + Firestore updates
+      const transfer = await stripeService.initiateManualPayout(partnerId, amount);
+
+      // Respond with new balance + lastPayoutDate so UI can refresh
+      const doc = await partnersCol.doc(partnerId).get();
+      const pdata = doc.exists ? doc.data() : {};
+      return res.json({
+        success: true,
+        transferId: transfer.id,
+        newBalance: Number(pdata.pendingPayout || 0),
+        lastPayoutDate: pdata.lastPayoutDate || new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('POST /host/payout error:', err);
+      return res.status(500).json({ error: err.message || 'Stripe error' });
+    }
+  }
+);
+
+module.exports = { partnerRouter, hostRouter };
