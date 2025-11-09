@@ -71,3 +71,8 @@ client/public/index.html # Prevents committing dev index.html
 client/build/ # Let Firebase handle the build folder
 /client/
 /node_modules/
+.env
+.env.local
+firebase-service-account.json
+serviceAccount*.json
+*.pem
