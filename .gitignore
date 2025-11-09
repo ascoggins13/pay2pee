@@ -83,3 +83,9 @@ node_modules
 *serviceAccount*.json
 *firebase-adminsdk*.json
 firebase-service-account.json
+.env
+.env.*
+serviceAccountKey.json
+*serviceAccount*.json
+*firebase-adminsdk*.json
+*.pem
