@@ -76,3 +76,10 @@ client/build/ # Let Firebase handle the build folder
 firebase-service-account.json
 serviceAccount*.json
 *.pem
+node_modules
+.env
+.env.*
+*.pem
+*serviceAccount*.json
+*firebase-adminsdk*.json
+firebase-service-account.json
