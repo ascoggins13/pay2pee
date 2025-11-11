@@ -10,7 +10,7 @@
     "test": "echo \"(no tests yet)\" && exit 0"
   },
   "engines": {
-    "node": ">=18.20.2",
+    "node": "18.20.2",
     "npm": ">=9"
   },
   "dependencies": {
