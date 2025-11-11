@@ -6,18 +6,12 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 
-// Firebase Admin (singleton)
+// Firebase Admin singleton (lives at repo root)
 const { admin, firestore } = require('./firebase-admin');
 
 const app = express();
 
-// ---------- Helper to normalize route exports ----------
-/**
- * Accepts:
- *   - CommonJS: module.exports = router
- *   - ESM default: export default router
- *   - Named: module.exports = { router }
- */
+// ---------- Helper: normalize route exports (CJS/ESM/{ router }) ----------
 const asRouter = (mod) => (mod && (mod.router || mod.default)) || mod;
 
 // ---------- Core middleware ----------
@@ -32,18 +26,11 @@ app.use(
 );
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-// ---------- Stripe webhook (RAW) FIRST ----------
-app.use(
-  '/api/webhooks/stripe',
-  asRouter(require('./server/routes/stripeWebhooksRoutes'))
-);
-// Optional legacy alias:
-app.use(
-  '/stripe-webhooks',
-  asRouter(require('./server/routes/stripeWebhooksRoutes'))
-);
+// ---------- Stripe webhooks (RAW body FIRST) ----------
+app.use('/api/webhooks/stripe', asRouter(require('./routes/stripeWebhooksRoutes')));
+app.use('/stripe-webhooks',      asRouter(require('./routes/stripeWebhooksRoutes')));
 
-// ---------- JSON parsers (after webhook) ----------
+// ---------- Body parsers (AFTER webhooks) ----------
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -55,34 +42,31 @@ app.get('/api/healthcheck', async (_req, res) => {
       status: 'healthy',
       serverTime: new Date().toISOString(),
       dbStatus: 'connected',
-      firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected',
+      firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
     });
   } catch {
     res.json({
       status: 'degraded',
       serverTime: new Date().toISOString(),
       dbStatus: 'unreachable',
-      firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected',
+      firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
     });
   }
 });
 
-// ---------- API routes (under server/routes) ----------
-app.use('/api/auth',          asRouter(require('./server/routes/auth')));
-app.use('/api/users',         asRouter(require('./server/routes/users')));
-
-// Match your frontend which calls /api/partner/...
-app.use('/api/partner',       asRouter(require('./server/routes/partnerRoutes')));
-
-app.use('/api/locations',     asRouter(require('./server/routes/locationRoutes')));
-app.use('/api/bathrooms',     asRouter(require('./server/routes/bathroomImageRoutes')));
-app.use('/api/subscriptions', asRouter(require('./server/routes/subscriptions')));
-app.use('/api/payments',      asRouter(require('./server/routes/paymentsRoutes')));
+// ---------- API routes (all under ./routes) ----------
+app.use('/api/auth',          asRouter(require('./routes/auth')));
+app.use('/api/users',         asRouter(require('./routes/users')));
+app.use('/api/partner',       asRouter(require('./routes/partnerRoutes'))); // matches frontend calls
+app.use('/api/locations',     asRouter(require('./routes/locationRoutes')));
+app.use('/api/bathrooms',     asRouter(require('./routes/bathroomImageRoutes')));
+app.use('/api/subscriptions', asRouter(require('./routes/subscriptions')));
+app.use('/api/payments',      asRouter(require('./routes/paymentsRoutes')));
 
 // If/when you add it:
-// app.use('/api/connect',       asRouter(require('./server/routes/connectRoutes')));
+// app.use('/api/connect',       asRouter(require('./routes/connectRoutes')));
 
-// ---------- Optional: serve client ----------
+// ---------- Optionally serve client build (if not using Firebase Hosting) ----------
 if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true') {
   app.use(express.static(path.join(__dirname, 'client/build')));
   app.get('*', (_req, res) => {
@@ -90,8 +74,9 @@ if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true'
   });
 }
 
-// ---------- 404 / Error handlers ----------
+// ---------- 404 + Error handlers ----------
 app.use((req, res) => res.status(404).json({ success: false, error: 'Endpoint not found' }));
+
 app.use((err, _req, res, _next) => {
   console.error('⚠️ Server Error:', err);
   res.status(500).json({
@@ -112,3 +97,4 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM received. Shutting down gracefully...');
   server.close(() => console.log('Process terminated'));
 });
+
