@@ -1,27 +1,36 @@
-const admin = require('firebase-admin');
-// firebase-admin.js
+// firebase-admin.js — singleton init (CommonJS)
 const admin = require('firebase-admin');
 
-// Prefer GOOGLE_APPLICATION_CREDENTIALS (path) or FIREBASE_SERVICE_ACCOUNT (JSON string)
+function getServiceAccountFromEnv() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) return null;
+  try {
+    const json = JSON.parse(raw);
+    // Normalize escaped newlines in the private key if needed
+    if (json.private_key && json.private_key.includes('\\n')) {
+      json.private_key = json.private_key.replace(/\\n/g, '\n');
+    }
+    return json;
+  } catch (e) {
+    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT:', e.message);
+    return null;
+  }
+}
+
 if (!admin.apps.length) {
-  const hasServiceJson = !!process.env.FIREBASE_SERVICE_ACCOUNT;
-  const hasDefaultCreds = !!process.env.GOOGLE_APPLICATION_CREDENTIALS;
-
-  if (hasServiceJson) {
-    // When you paste the service account JSON into an env var
-    const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  const sa = getServiceAccountFromEnv();
+  if (sa) {
     admin.initializeApp({
       credential: admin.credential.cert(sa),
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET, // e.g. p2p-storage.appspot.com
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET, // e.g. pay2pee-xxxx.appspot.com
     });
-  } else if (hasDefaultCreds) {
-    // When GOOGLE_APPLICATION_CREDENTIALS points to a JSON file path
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     admin.initializeApp({
       credential: admin.credential.applicationDefault(),
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
     });
   } else {
-    // Local fallback: allow emulator/default without creds file (only if you know what you're doing)
+    // Last-resort local fallback (emulators)
     admin.initializeApp();
   }
 }
