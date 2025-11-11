@@ -6,25 +6,42 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 
-// Initialize Firebase Admin
+// Firebase Admin (singleton)
 const { admin, firestore } = require('./firebase-admin');
 
 const app = express();
 
+// ---------- Helper to normalize route exports ----------
+/**
+ * Accepts:
+ *   - CommonJS: module.exports = router
+ *   - ESM default: export default router
+ *   - Named: module.exports = { router }
+ */
+const asRouter = (mod) => (mod && (mod.router || mod.default)) || mod;
+
 // ---------- Core middleware ----------
 app.set('trust proxy', 1);
-app.use(cors({
-  origin: ['https://pay2pee.app', 'http://localhost:3000'],
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: ['https://pay2pee.app', 'http://localhost:3000'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+  })
+);
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // ---------- Stripe webhook (RAW) FIRST ----------
-app.use('/api/webhooks/stripe', require('./routes/stripeWebhooksRoutes'));
-// Optional alias if you ever pointed Stripe here:
-app.use('/stripe-webhooks', require('./routes/stripeWebhooksRoutes'));
+app.use(
+  '/api/webhooks/stripe',
+  asRouter(require('./server/routes/stripeWebhooksRoutes'))
+);
+// Optional legacy alias:
+app.use(
+  '/stripe-webhooks',
+  asRouter(require('./server/routes/stripeWebhooksRoutes'))
+);
 
 // ---------- JSON parsers (after webhook) ----------
 app.use(express.json({ limit: '10mb' }));
@@ -38,29 +55,34 @@ app.get('/api/healthcheck', async (_req, res) => {
       status: 'healthy',
       serverTime: new Date().toISOString(),
       dbStatus: 'connected',
-      firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected'
+      firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected',
     });
   } catch {
     res.json({
       status: 'degraded',
       serverTime: new Date().toISOString(),
       dbStatus: 'unreachable',
-      firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected'
+      firebaseStatus: admin.apps.length > 0 ? 'connected' : 'disconnected',
     });
   }
 });
 
-// ---------- API routes ----------
-app.use('/api/auth',          require('./routes/auth'));
-app.use('/api/users',         require('./routes/users'));
-app.use('/api/partners',      require('./routes/partnerRoutes'));
-app.use('/api/locations',     require('./routes/locationRoutes'));
-app.use('/api/bathrooms',     require('./routes/bathroomImageRoutes'));
-app.use('/api/subscriptions', require('./routes/subscriptions'));
-app.use('/api/payments',      require('./routes/paymentsRoutes'));
-app.use('/api/connect',       require('./routes/connectRoutes'));   // ⬅️ NEW: Stripe Connect (create account, onboard link, etc.)
+// ---------- API routes (under server/routes) ----------
+app.use('/api/auth',          asRouter(require('./server/routes/auth')));
+app.use('/api/users',         asRouter(require('./server/routes/users')));
 
-// ---------- Optional: serve client (if not using Firebase Hosting) ----------
+// Match your frontend which calls /api/partner/...
+app.use('/api/partner',       asRouter(require('./server/routes/partnerRoutes')));
+
+app.use('/api/locations',     asRouter(require('./server/routes/locationRoutes')));
+app.use('/api/bathrooms',     asRouter(require('./server/routes/bathroomImageRoutes')));
+app.use('/api/subscriptions', asRouter(require('./server/routes/subscriptions')));
+app.use('/api/payments',      asRouter(require('./server/routes/paymentsRoutes')));
+
+// If/when you add it:
+// app.use('/api/connect',       asRouter(require('./server/routes/connectRoutes')));
+
+// ---------- Optional: serve client ----------
 if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true') {
   app.use(express.static(path.join(__dirname, 'client/build')));
   app.get('*', (_req, res) => {
@@ -74,7 +96,7 @@ app.use((err, _req, res, _next) => {
   console.error('⚠️ Server Error:', err);
   res.status(500).json({
     success: false,
-    error: process.env.NODE_ENV === 'development' ? err.message : 'Server error'
+    error: process.env.NODE_ENV === 'development' ? err.message : 'Server error',
   });
 });
 
