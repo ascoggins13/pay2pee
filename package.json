@@ -25,6 +25,7 @@
     "geofire-common": "^6.0.0",
     "jsonwebtoken": "9.0.2",
     "morgan": "^1.10.0",
+    "multer": "^2.0.2",
     "path-to-regexp": "6.2.1",
     "stripe": "14.25.0"
   },
