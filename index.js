@@ -5,16 +5,34 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
+const fs = require('fs');
 
 // Firebase Admin singleton (lives at repo root)
 const { admin, firestore } = require('./firebase-admin');
 
 const app = express();
 
-// ---------- Helper: normalize route exports (CJS/ESM/{ router }) ----------
+// ---------- helpers ----------
 const asRouter = (mod) => (mod && (mod.router || mod.default)) || mod;
 
-// ---------- Core middleware ----------
+function pickRoute(label, relPath) {
+  const abs = path.join(__dirname, relPath);
+  const exists = fs.existsSync(abs) || fs.existsSync(abs + '.js');
+  if (!exists) {
+    console.error(`[route:${label}] NOT FOUND at ${relPath}`);
+    throw new Error(`Missing route file for ${label}: ${relPath}`);
+  }
+  const raw = require(abs);
+  const picked = asRouter(raw);
+  console.log(
+    `[route:${label}] from ${relPath} -> rawType=${typeof raw}` +
+    (raw && typeof raw === 'object' ? ` rawKeys=[${Object.keys(raw)}]` : '') +
+    ` pickedType=${typeof picked}`
+  );
+  return picked;
+}
+
+// ---------- core middleware ----------
 app.set('trust proxy', 1);
 app.use(
   cors({
@@ -27,14 +45,15 @@ app.use(
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // ---------- Stripe webhooks (RAW body FIRST) ----------
-app.use('/api/webhooks/stripe', asRouter(require('./routes/stripeWebhooksRoutes')));
-app.use('/stripe-webhooks',      asRouter(require('./routes/stripeWebhooksRoutes')));
+const stripeWebhooks = pickRoute('webhooks', './routes/stripeWebhooksRoutes');
+app.use('/api/webhooks/stripe', stripeWebhooks);
+app.use('/stripe-webhooks',      stripeWebhooks);
 
 // ---------- Body parsers (AFTER webhooks) ----------
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ---------- Healthcheck ----------
+// ---------- healthcheck ----------
 app.get('/api/healthcheck', async (_req, res) => {
   try {
     await firestore.collection('_meta').limit(1).get();
@@ -54,19 +73,18 @@ app.get('/api/healthcheck', async (_req, res) => {
   }
 });
 
-// ---------- API routes (all under ./routes) ----------
-app.use('/api/auth',          asRouter(require('./routes/auth')));
-app.use('/api/users',         asRouter(require('./routes/users')));
-app.use('/api/partner',       asRouter(require('./routes/partnerRoutes'))); // matches frontend calls
-app.use('/api/locations',     asRouter(require('./routes/locationRoutes')));
-app.use('/api/bathrooms',     asRouter(require('./routes/bathroomImageRoutes')));
-app.use('/api/subscriptions', asRouter(require('./routes/subscriptions')));
-app.use('/api/payments',      asRouter(require('./routes/paymentsRoutes')));
+// ---------- API routes ----------
+app.use('/api/auth',          pickRoute('auth',          './routes/auth'));
+app.use('/api/users',         pickRoute('users',         './routes/users'));
+app.use('/api/partner',       pickRoute('partner',       './routes/partnerRoutes'));
+app.use('/api/locations',     pickRoute('locations',     './routes/locationRoutes'));
+app.use('/api/bathrooms',     pickRoute('bathrooms',     './routes/bathroomImageRoutes'));
+app.use('/api/subscriptions', pickRoute('subscriptions', './routes/subscriptions'));
+app.use('/api/payments',      pickRoute('payments',      './routes/paymentsRoutes'));
+// If/when you add connect:
+// app.use('/api/connect',    pickRoute('connect',       './routes/connectRoutes'));
 
-// If/when you add it:
-// app.use('/api/connect',       asRouter(require('./routes/connectRoutes')));
-
-// ---------- Optionally serve client build (if not using Firebase Hosting) ----------
+// ---------- serve client (optional) ----------
 if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true') {
   app.use(express.static(path.join(__dirname, 'client/build')));
   app.get('*', (_req, res) => {
@@ -74,7 +92,7 @@ if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true'
   });
 }
 
-// ---------- 404 + Error handlers ----------
+// ---------- 404 + error handlers ----------
 app.use((req, res) => res.status(404).json({ success: false, error: 'Endpoint not found' }));
 
 app.use((err, _req, res, _next) => {
@@ -85,16 +103,16 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-// ---------- Start ----------
+// ---------- start ----------
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`🚀 Pay2Pee server running on port ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🟡 Node ${process.version} — consider upgrading to 20.x in package.json "engines"`);
 });
 
-// ---------- Graceful shutdown ----------
+// ---------- graceful shutdown ----------
 process.on('SIGTERM', () => {
   console.log('SIGTERM received. Shutting down gracefully...');
   server.close(() => console.log('Process terminated'));
 });
-
