@@ -2,7 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const admin = require('firebase-admin');
+const { admin, firestore } = require('../firebase-admin'); // path from that file
 const db = admin.firestore();
 
 // Create a Stripe Express account for the partner

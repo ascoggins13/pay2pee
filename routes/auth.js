@@ -15,7 +15,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const admin = require('firebase-admin');
+const { admin, firestore } = require('../firebase-admin'); // path from that file
 
 const router = express.Router();
 

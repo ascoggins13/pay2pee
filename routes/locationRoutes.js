@@ -2,7 +2,7 @@
 const express = require('express');
 const { query, body, validationResult } = require('express-validator');
 const geofire = require('geofire-common');
-const { admin, firestore } = require('../firebase-admin');
+const { admin, firestore } = require('../firebase-admin'); // path from that file
 const protect = require('../middleware/protect'); // your JWT middleware
 
 const router = express.Router();

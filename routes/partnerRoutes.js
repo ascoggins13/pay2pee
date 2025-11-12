@@ -3,7 +3,7 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 
 const protect = require('../middleware/protect');
-const { admin, firestore } = require('../firebase-admin');
+const { admin, firestore } = require('../firebase-admin'); // path from that file
 const stripeService = require('../services/stripeService');
 
 const usersCol = firestore.collection('users');
