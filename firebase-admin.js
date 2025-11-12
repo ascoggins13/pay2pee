@@ -1,47 +1,61 @@
-// firebase-admin.js (pin project & creds, explicit Firestore client)
-const admin = require('firebase-admin');
-const { Firestore } = require('@google-cloud/firestore');
+// firebase-admin.js
+// One place to initialize Firebase Admin cleanly for Render/Node.
 
-function getServiceAccount() {
-  if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT env var is missing.');
+const admin = require('firebase-admin');
+
+function parseServiceAccount() {
+  // Preferred: put your service account JSON (one-line) in FIREBASE_SERVICE_ACCOUNT
+  // Fallbacks: GOOGLE_APPLICATION_CREDENTIALS (path) or applicationDefault()
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+      return admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+    } catch (e) {
+      console.error('❌ Failed to JSON.parse(FIREBASE_SERVICE_ACCOUNT):', e.message);
+      throw e;
+    }
   }
-  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  if (!sa.project_id || !sa.client_email || !sa.private_key) {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT is missing required fields (project_id, client_email, private_key).');
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return admin.credential.applicationDefault();
   }
-  return sa;
+  return admin.credential.applicationDefault();
 }
 
-let app, firestore, bucket;
 if (!admin.apps.length) {
-  const sa = getServiceAccount();
+  const credential = parseServiceAccount();
+
+  // Pick projectId and storage bucket smartly
   const projectId =
     process.env.FIREBASE_PROJECT_ID ||
-    process.env.GOOGLE_CLOUD_PROJECT ||
-    process.env.GCLOUD_PROJECT ||
-    sa.project_id;
+    (process.env.FIREBASE_SERVICE_ACCOUNT
+      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT).project_id
+      : undefined);
 
-  app = admin.initializeApp({
-    credential: admin.credential.cert(sa),
+  // IMPORTANT: Firestore uses PROJECT.appspot.com buckets for Admin SDK
+  const defaultBucket =
+    process.env.FIREBASE_STORAGE_BUCKET ||
+    (projectId ? `${projectId}.appspot.com` : undefined);
+
+  admin.initializeApp({
+    credential,
     projectId,
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET || `${projectId}.appspot.com`,
+    storageBucket: defaultBucket,
   });
-
-  // Use explicit Firestore client (removes ambiguity):
-  firestore = new Firestore({
-    projectId,
-    credentials: {
-      client_email: sa.client_email,
-      private_key: sa.private_key,
-    },
-  });
-
-  bucket = admin.storage().bucket();
-} else {
-  app = admin.app();
-  firestore = admin.firestore();
-  bucket = admin.storage().bucket();
 }
 
-module.exports = { admin, firestore, bucket };
+const firestore = admin.firestore();
+const bucket = admin.storage().bucket();
+
+// Small helpers for debugging
+function resolvedInfo() {
+  const app = admin.app();
+  return {
+    resolvedProjectId:
+      app.options.projectId ||
+      (process.env.FIREBASE_SERVICE_ACCOUNT
+        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT).project_id
+        : undefined),
+    storageBucket: app.options.storageBucket,
+  };
+}
+
+module.exports = { admin, firestore, bucket, resolvedInfo };
