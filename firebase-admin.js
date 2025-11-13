@@ -1,37 +1,44 @@
 // firebase-admin.js
-const admin = require("firebase-admin");
+const admin = require('firebase-admin');
 
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-  throw new Error(
-    "FIREBASE_SERVICE_ACCOUNT env var is missing. Set it in Render -> Environment."
-  );
+let app;
+
+// Only init once
+if (!admin.apps.length) {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    let serviceAccount;
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    } catch (err) {
+      console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT:', err);
+      throw err;
+    }
+
+    // Normalize private key in case \n are double-escaped
+    if (serviceAccount.private_key) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
+
+    app = admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      projectId: serviceAccount.project_id,
+      storageBucket:
+        process.env.FIREBASE_STORAGE_BUCKET ||
+        `${serviceAccount.project_id}.appspot.com`,
+    });
+  } else {
+    // Fallback (not recommended for prod, but won't crash)
+    console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT not set, using applicationDefault()');
+    app = admin.initializeApp({
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+    });
+  }
 }
-
-let serviceJson;
-try {
-  serviceJson = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-} catch (err) {
-  console.error("[firebase-admin] Failed to parse FIREBASE_SERVICE_ACCOUNT:", err);
-  throw err; // hard fail so we don't run half-configured
-}
-
-// IMPORTANT: set projectId and storageBucket explicitly
-const app = admin.initializeApp({
-  credential: admin.credential.cert(serviceJson),
-  projectId: serviceJson.project_id || "pay2pee-8af3d",
-  storageBucket: "pay2pee-8af3d.appspot.com",
-});
 
 const firestore = admin.firestore();
 const bucket = admin.storage().bucket();
 
-function getFirebaseConfigInfo() {
-  const opts = app.options || {};
-  return {
-    projectId: opts.projectId || null,
-    storageBucket: opts.storageBucket || null,
-  };
-}
+module.exports = { admin, firestore, bucket };
 
 async function firestoreSmokeTest() {
   const ref = firestore.collection("_debug").doc("smoketest");
