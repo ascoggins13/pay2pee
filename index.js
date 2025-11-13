@@ -1,152 +1,136 @@
 // index.js — Pay2Pee Backend (Firestore + Stripe + Connect)
-require("dotenv").config();
+require('dotenv').config();
 
-const express = require("express");
-const cors = require("cors");
-const morgan = require("morgan");
-const path = require("path");
+const express = require('express');
+const cors = require('cors');
+const morgan = require('morgan');
+const path = require('path');
 
-// Firebase Admin (centralized here)
 const {
   admin,
   firestore,
   getFirebaseConfigInfo,
-  firestoreSmokeTest,
-} = require("./firebase-admin");
+  getFirestoreSmoketest,
+} = require('./firebase-admin');
 
 const app = express();
 
 /* -------------------- Core middleware -------------------- */
-app.set("trust proxy", 1);
+app.set('trust proxy', 1);
 
 app.use(
   cors({
-    origin: ["https://pay2pee.app", "http://localhost:3000"],
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    origin: ['https://pay2pee.app', 'http://localhost:3000'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   })
 );
 
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 /* ---------------- Stripe webhooks (RAW FIRST) ------------- */
-// Must come BEFORE any JSON/body parsers
-const stripeWebhooksRouter = require("./routes/stripeWebhooksRoutes");
-app.use("/api/webhooks/stripe", stripeWebhooksRouter);
-// legacy alias if you ever used this URL:
-app.use("/stripe-webhooks", stripeWebhooksRouter);
+const stripeWebhooksRouter = require('./routes/stripeWebhooksRoutes');
+app.use('/api/webhooks/stripe', stripeWebhooksRouter);
+app.use('/stripe-webhooks', stripeWebhooksRouter); // legacy alias if needed
 
 /* --------------- Body parsers (AFTER webhooks) ------------ */
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-/* ---------------------- Debug routes ---------------------- */
-// Quick check of Firebase project + bucket wiring
-app.get("/api/_debug/firebase", (req, res) => {
+/* ---------------------- Debug endpoints ------------------- */
+
+// Shows what Firebase Admin thinks your config is
+app.get('/api/_debug/firebase', (req, res) => {
   try {
     const info = getFirebaseConfigInfo();
     res.json(info);
   } catch (err) {
-    console.error("[_debug/firebase] error:", err);
-    res.status(500).json({ error: err.message || String(err) });
+    console.error('getFirebaseConfigInfo error:', err);
+    res.status(500).json({ ok: false, message: err.message || 'debug error' });
   }
 });
 
-// Actually perform a Firestore write+read
-app.get("/api/_debug/fs-smoketest", async (req, res) => {
+// Actually hit Firestore to confirm reads work
+app.get('/api/_debug/fs-smoketest', async (req, res) => {
   try {
-    const result = await firestoreSmokeTest();
-    res.json({ ok: true, ...result });
+    const result = await getFirestoreSmoketest();
+    res.json(result);
   } catch (err) {
-    console.error("[_debug/fs-smoketest] error:", err);
-    res
-      .status(500)
-      .json({ ok: false, code: err.code, message: err.message || String(err) });
+    console.error('getFirestoreSmoketest error:', err);
+    res.status(500).json({ ok: false, message: err.message || 'smoketest error' });
   }
 });
 
 /* ---------------------- Healthcheck ----------------------- */
-app.get("/api/healthcheck", async (_req, res) => {
+app.get('/api/healthcheck', async (_req, res) => {
   try {
-    // Lightweight doc read instead of a query (avoids gRPC NOT_FOUND noise)
-    const ref = firestore.collection("_meta").doc("health");
-    await ref.set(
-      { lastCheck: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-    const snap = await ref.get();
-
+    await firestore.collection('_meta').limit(1).get();
     res.json({
-      status: "healthy",
+      status: 'healthy',
       serverTime: new Date().toISOString(),
-      dbStatus: "connected",
-      firebaseStatus: admin.apps.length ? "connected" : "disconnected",
-      metaExists: snap.exists,
+      dbStatus: 'connected',
+      firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
     });
   } catch (err) {
-    console.error("[healthcheck] error:", err);
+    console.warn('Healthcheck Firestore error:', err.message || err);
     res.json({
-      status: "degraded",
+      status: 'degraded',
       serverTime: new Date().toISOString(),
-      dbStatus: "unreachable",
-      firebaseStatus: admin.apps.length ? "connected" : "disconnected",
-      error: err.message || String(err),
+      dbStatus: 'unreachable',
+      firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
     });
   }
 });
 
-/* ------------------------ API Routes ---------------------- */
-// Simple routers (each file: module.exports = router)
-app.use("/api/auth", require("./routes/auth"));
-app.use("/api/users", require("./routes/users"));
-app.use("/api/locations", require("./routes/locationRoutes"));
-app.use("/api/bathrooms", require("./routes/bathroomImageRoutes"));
-app.use("/api/subscriptions", require("./routes/subscriptions"));
-app.use("/api/payments", require("./routes/paymentsRoutes"));
+/* ------------------------ API routes ---------------------- */
 
-// Partner routes: your file may export { partnerRouter, hostRouter }
+// Simple routers (each must do: module.exports = router)
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/locations', require('./routes/locationRoutes'));
+app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
+app.use('/api/subscriptions', require('./routes/subscriptions'));
+app.use('/api/payments', require('./routes/paymentsRoutes'));
+
+// Partner routes — partnerRoutes.js exports { partnerRouter, hostRouter }
 (() => {
-  const partnerModule = require("./routes/partnerRoutes");
+  const partnerModule = require('./routes/partnerRoutes');
 
   if (partnerModule && (partnerModule.partnerRouter || partnerModule.hostRouter)) {
     if (partnerModule.partnerRouter) {
-      app.use("/api/partner", partnerModule.partnerRouter);
+      app.use('/api/partner', partnerModule.partnerRouter);
     }
     if (partnerModule.hostRouter) {
-      app.use("/api/host", partnerModule.hostRouter);
+      app.use('/api/host', partnerModule.hostRouter);
     }
   } else {
-    // Fallback if it just exports a single router
-    app.use("/api/partner", partnerModule);
+    // Fallback if it exports a single router
+    app.use('/api/partner', partnerModule);
   }
 })();
 
-// If/when you add Stripe Connect account onboarding endpoints:
-// app.use("/api/connect", require("./routes/connectRoutes"));
+// If/when you add Stripe Connect business routes:
+// app.use('/api/connect', require('./routes/connectRoutes'));
 
 /* --------------- Serve client (optional) ------------------ */
-// Only if you later decide to serve React from this server
-if (process.env.NODE_ENV === "production" && process.env.SERVE_CLIENT === "true") {
-  app.use(express.static(path.join(__dirname, "client/build")));
-  app.get("*", (_req, res) => {
-    res.sendFile(path.join(__dirname, "client/build", "index.html"));
+if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true') {
+  app.use(express.static(path.join(__dirname, 'client/build')));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
   });
 }
 
 /* ---------------- 404 + Error handlers -------------------- */
 app.use((req, res) =>
-  res.status(404).json({ success: false, error: "Endpoint not found" })
+  res.status(404).json({ success: false, error: 'Endpoint not found' })
 );
 
 app.use((err, _req, res, _next) => {
-  console.error("⚠️ Server Error:", err);
+  console.error('⚠️ Server Error:', err);
   res.status(500).json({
     success: false,
-    error:
-      process.env.NODE_ENV === "development"
-        ? err.message || String(err)
-        : "Server error",
+    error: process.env.NODE_ENV === 'development' ? err.message : 'Server error',
   });
 });
 
@@ -154,12 +138,11 @@ app.use((err, _req, res, _next) => {
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`🚀 Pay2Pee server running on port ${PORT}`);
-  console.log(`🌐 Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 /* ------------------ Graceful shutdown --------------------- */
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received. Shutting down gracefully...");
-  server.close(() => console.log("Process terminated"));
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => console.log('Process terminated'));
 });
-
