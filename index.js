@@ -6,11 +6,13 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 
+// Our centralized firebase helper
 const {
   admin,
   firestore,
+  bucket,
   getFirebaseConfigInfo,
-  getFirestoreSmoketest,
+  firestoreSmokeTest,
 } = require('./firebase-admin');
 
 const app = express();
@@ -30,37 +32,13 @@ app.use(
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 /* ---------------- Stripe webhooks (RAW FIRST) ------------- */
-const stripeWebhooksRouter = require('./routes/stripeWebhooksRoutes');
-app.use('/api/webhooks/stripe', stripeWebhooksRouter);
-app.use('/stripe-webhooks', stripeWebhooksRouter); // legacy alias if needed
+const stripeWebhooks = require('./routes/stripeWebhooksRoutes');
+app.use('/api/webhooks/stripe', stripeWebhooks);
+app.use('/stripe-webhooks', stripeWebhooks); // legacy alias if Stripe is pointed here
 
 /* --------------- Body parsers (AFTER webhooks) ------------ */
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-/* ---------------------- Debug endpoints ------------------- */
-
-// Shows what Firebase Admin thinks your config is
-app.get('/api/_debug/firebase', (req, res) => {
-  try {
-    const info = getFirebaseConfigInfo();
-    res.json(info);
-  } catch (err) {
-    console.error('getFirebaseConfigInfo error:', err);
-    res.status(500).json({ ok: false, message: err.message || 'debug error' });
-  }
-});
-
-// Actually hit Firestore to confirm reads work
-app.get('/api/_debug/fs-smoketest', async (req, res) => {
-  try {
-    const result = await getFirestoreSmoketest();
-    res.json(result);
-  } catch (err) {
-    console.error('getFirestoreSmoketest error:', err);
-    res.status(500).json({ ok: false, message: err.message || 'smoketest error' });
-  }
-});
 
 /* ---------------------- Healthcheck ----------------------- */
 app.get('/api/healthcheck', async (_req, res) => {
@@ -73,7 +51,7 @@ app.get('/api/healthcheck', async (_req, res) => {
       firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
     });
   } catch (err) {
-    console.warn('Healthcheck Firestore error:', err.message || err);
+    console.error('Healthcheck Firestore error:', err);
     res.json({
       status: 'degraded',
       serverTime: new Date().toISOString(),
@@ -83,9 +61,22 @@ app.get('/api/healthcheck', async (_req, res) => {
   }
 });
 
-/* ------------------------ API routes ---------------------- */
+/* ----------------- Debug endpoints ------------------------ */
 
-// Simple routers (each must do: module.exports = router)
+// Shows projectId, databaseId, bucket, and credential source
+app.get('/api/_debug/firebase', (_req, res) => {
+  res.json(getFirebaseConfigInfo());
+});
+
+// Actually touches Firestore and returns ok / error
+app.get('/api/_debug/fs-smoketest', async (_req, res) => {
+  const result = await firestoreSmokeTest();
+  res.json(result);
+});
+
+/* ------------------------ Routes -------------------------- */
+
+// Simple routers (each must export `module.exports = router`)
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/locations', require('./routes/locationRoutes'));
@@ -93,7 +84,7 @@ app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
 
-// Partner routes — partnerRoutes.js exports { partnerRouter, hostRouter }
+// Partner routes — file exports { partnerRouter, hostRouter } OR a single router
 (() => {
   const partnerModule = require('./routes/partnerRoutes');
 
@@ -105,12 +96,12 @@ app.use('/api/payments', require('./routes/paymentsRoutes'));
       app.use('/api/host', partnerModule.hostRouter);
     }
   } else {
-    // Fallback if it exports a single router
+    // fallback if it’s just a single router export
     app.use('/api/partner', partnerModule);
   }
 })();
 
-// If/when you add Stripe Connect business routes:
+// When you’re ready for Stripe Connect:
 // app.use('/api/connect', require('./routes/connectRoutes'));
 
 /* --------------- Serve client (optional) ------------------ */
