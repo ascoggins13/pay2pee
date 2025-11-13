@@ -1,61 +1,80 @@
 // firebase-admin.js
-// One place to initialize Firebase Admin cleanly for Render/Node.
+const admin = require("firebase-admin");
 
-const admin = require('firebase-admin');
+let app;
 
-function parseServiceAccount() {
-  // Preferred: put your service account JSON (one-line) in FIREBASE_SERVICE_ACCOUNT
-  // Fallbacks: GOOGLE_APPLICATION_CREDENTIALS (path) or applicationDefault()
+// Try to use FIREBASE_SERVICE_ACCOUNT from env (JSON)
+if (!admin.apps.length) {
+  let opts = {};
+
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     try {
-      return admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
-    } catch (e) {
-      console.error('❌ Failed to JSON.parse(FIREBASE_SERVICE_ACCOUNT):', e.message);
-      throw e;
+      const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+      opts = {
+        credential: admin.credential.cert(sa),
+        // This MUST match your real bucket:
+        storageBucket: "pay2pee-8af3d.appspot.com",
+      };
+
+      console.log("[firebase-admin] Initialized with FIREBASE_SERVICE_ACCOUNT for project:", sa.project_id);
+    } catch (err) {
+      console.error("[firebase-admin] Failed to parse FIREBASE_SERVICE_ACCOUNT:", err);
+      // Fallback: applicationDefault (only works if Render has GCP creds mounted)
+      opts = {
+        credential: admin.credential.applicationDefault(),
+        storageBucket: "pay2pee-8af3d.appspot.com",
+      };
+      console.log("[firebase-admin] Falling back to applicationDefault credentials.");
     }
+  } else {
+    // No explicit service account JSON, rely on application default
+    opts = {
+      credential: admin.credential.applicationDefault(),
+      storageBucket: "pay2pee-8af3d.appspot.com",
+    };
+    console.log("[firebase-admin] Initialized with applicationDefault credentials.");
   }
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    return admin.credential.applicationDefault();
-  }
-  return admin.credential.applicationDefault();
-}
 
-if (!admin.apps.length) {
-  const credential = parseServiceAccount();
-
-  // Pick projectId and storage bucket smartly
-  const projectId =
-    process.env.FIREBASE_PROJECT_ID ||
-    (process.env.FIREBASE_SERVICE_ACCOUNT
-      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT).project_id
-      : undefined);
-
-  // IMPORTANT: Firestore uses PROJECT.appspot.com buckets for Admin SDK
-  const defaultBucket =
-    process.env.FIREBASE_STORAGE_BUCKET ||
-    (projectId ? `${projectId}.appspot.com` : undefined);
-
-  admin.initializeApp({
-    credential,
-    projectId,
-    storageBucket: defaultBucket,
-  });
+  app = admin.initializeApp(opts);
+} else {
+  app = admin.app();
 }
 
 const firestore = admin.firestore();
 const bucket = admin.storage().bucket();
 
-// Small helpers for debugging
-function resolvedInfo() {
-  const app = admin.app();
+/**
+ * Small helpers for debug endpoints
+ */
+function getFirebaseConfigInfo() {
+  const options = app.options || {};
   return {
-    resolvedProjectId:
-      app.options.projectId ||
-      (process.env.FIREBASE_SERVICE_ACCOUNT
-        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT).project_id
-        : undefined),
-    storageBucket: app.options.storageBucket,
+    projectId: options.projectId || null,
+    storageBucket: options.storageBucket || null,
   };
 }
 
-module.exports = { admin, firestore, bucket, resolvedInfo };
+async function firestoreSmokeTest() {
+  const ref = firestore.collection("_debug").doc("smoketest");
+  await ref.set(
+    {
+      ping: "ok",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+  const snap = await ref.get();
+  return {
+    exists: snap.exists,
+    data: snap.data() || null,
+  };
+}
+
+module.exports = {
+  admin,
+  firestore,
+  bucket,
+  getFirebaseConfigInfo,
+  firestoreSmokeTest,
+};
