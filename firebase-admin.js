@@ -1,103 +1,85 @@
 // firebase-admin.js
+require('dotenv').config();
+
 const admin = require('firebase-admin');
+const { getFirestore } = require('firebase-admin/firestore');
+const { getStorage } = require('firebase-admin/storage');
 
+// ---- Load service account JSON from env ----
+let serviceAccount = null;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } catch (e) {
+    console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT:', e.message);
+  }
+}
+
+const projectId =
+  process.env.FIREBASE_PROJECT_ID ||
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  (serviceAccount && serviceAccount.project_id);
+
+const databaseId = process.env.FIRESTORE_DATABASE_ID || 'payouts'; // ⬅️ default to payouts
+const storageBucket =
+  process.env.FIREBASE_STORAGE_BUCKET ||
+  `${projectId}.appspot.com`;
+
+// ---- Initialize app ----
 let app;
-let cachedConfigInfo = null;
-
-// Only initialize once
 if (!admin.apps.length) {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    let serviceAccount;
-    try {
-      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    } catch (err) {
-      console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT:', err);
-      throw err;
-    }
-
-    // Normalize the private key (fixes \n escaping from env)
-    if (serviceAccount.private_key) {
-      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
-    }
-
-    const projectId = serviceAccount.project_id;
-    const storageBucket =
-      process.env.FIREBASE_STORAGE_BUCKET || `${projectId}.appspot.com`;
-
+  if (serviceAccount) {
     app = admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       projectId,
       storageBucket,
     });
-
-    cachedConfigInfo = {
+  } else {
+    // fallback, but you *should* be using FIREBASE_SERVICE_ACCOUNT in prod
+    app = admin.initializeApp({
+      credential: admin.credential.applicationDefault(),
       projectId,
       storageBucket,
-      from: 'SERVICE_ACCOUNT',
-    };
-  } else {
-    console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT not set, using applicationDefault()');
-
-    const storageBucket = process.env.FIREBASE_STORAGE_BUCKET || undefined;
-
-    app = admin.initializeApp({
-      storageBucket,
     });
-
-    cachedConfigInfo = {
-      projectId:
-        process.env.GCLOUD_PROJECT ||
-        process.env.GOOGLE_CLOUD_PROJECT ||
-        app?.options?.projectId ||
-        null,
-      storageBucket,
-      from: 'APPLICATION_DEFAULT',
-    };
   }
+} else {
+  app = admin.app();
 }
 
-const firestore = admin.firestore();
-const bucket = admin.storage().bucket();
+// Use the *payouts* database
+const firestore = getFirestore(app, databaseId);
+// Storage
+const bucket = getStorage(app).bucket();
 
-/**
- * Debug helper for /api/_debug/fs-smoketest
- * Tries to read from the _meta collection.
- */
-async function getFirestoreSmoketest() {
+// ---- Debug helpers (used by /api/_debug routes) ----
+function getFirebaseConfigInfo() {
+  return {
+    projectId: firestore.projectId || projectId || null,
+    databaseId,
+    storageBucket,
+    from: serviceAccount ? 'SERVICE_ACCOUNT' : 'APPLICATION_DEFAULT',
+  };
+}
+
+async function firestoreSmokeTest() {
   try {
-    const snap = await firestore.collection('_meta').limit(1).get();
-    return {
-      ok: true,
-      count: snap.size,
-    };
+    // just try to read from the special root list of collections
+    const collections = await firestore.listCollections();
+    return { ok: true, count: collections.length };
   } catch (err) {
-    console.error('🔥 Firestore smoketest failed:', err);
+    console.error('firestoreSmokeTest error:', err);
     return {
       ok: false,
       code: err.code,
-      message: err.message,
+      message: String(err.message || err),
     };
   }
-}
-
-/**
- * Debug helper for /api/_debug/firebase
- * Returns projectId & storageBucket as seen by the SDK.
- */
-function getFirebaseConfigInfo() {
-  if (cachedConfigInfo) return cachedConfigInfo;
-
-  return {
-    projectId: app?.options?.projectId || null,
-    storageBucket: app?.options?.storageBucket || null,
-    from: 'APP_OPTIONS',
-  };
 }
 
 module.exports = {
   admin,
   firestore,
   bucket,
-  getFirestoreSmoketest,
   getFirebaseConfigInfo,
+  firestoreSmokeTest,
 };
