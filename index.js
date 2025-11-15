@@ -83,6 +83,7 @@ app.use('/api/locations', require('./routes/locationRoutes'));
 app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
+app.use('/api/partner', require('./routes/partnerAnalytics'));
 
 // Partner routes — file exports { partnerRouter, hostRouter } OR a single router
 (() => {
