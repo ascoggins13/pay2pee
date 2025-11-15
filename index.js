@@ -20,14 +20,29 @@ const app = express();
 /* -------------------- Core middleware -------------------- */
 app.set('trust proxy', 1);
 
-app.use(
-  cors({
-    origin: ['https://pay2pee.app', 'http://localhost:3000'],
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-  })
-);
+const allowedOrigins = [
+  'https://pay2pee.app',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, server-to-server)
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+};
+
+// Apply CORS to all routes
+app.use(cors(corsOptions));
+// Ensure preflight (OPTIONS) also gets CORS headers
+app.options('*', cors(corsOptions));
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
@@ -83,7 +98,6 @@ app.use('/api/locations', require('./routes/locationRoutes'));
 app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
-app.use('/api/partner', require('./routes/partnerAnalytics'));
 
 // Partner routes — file exports { partnerRouter, hostRouter } OR a single router
 (() => {
