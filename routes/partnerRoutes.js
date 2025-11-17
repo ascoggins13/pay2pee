@@ -146,6 +146,36 @@ hostRouter.put(
     }
   }
 );
+/**
+ * PUT /api/host/auto-accept
+ * Globally toggle autoAcceptGuests for this host's location.
+ */
+hostRouter.put(
+  '/auto-accept',
+  protect,
+  [body('autoAcceptGuests').isBoolean()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const userId = req.user.userId;
+      const { autoAcceptGuests } = req.body;
+
+      const snap = await locationsCol.where('owner', '==', userId).limit(1).get();
+      if (snap.empty) return res.status(404).json({ error: 'Location not found' });
+
+      const ref = snap.docs[0].ref;
+      await ref.set({ autoAcceptGuests }, { merge: true });
+
+      const updated = await ref.get();
+      return res.json({ id: ref.id, ...updated.data() });
+    } catch (err) {
+      console.error('PUT /host/auto-accept error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  }
+);
 
 /**
  * POST /api/host/payout

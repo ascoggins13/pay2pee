@@ -28,10 +28,14 @@ async function listActivePrices() {
       if (Array.isArray(product?.metadata?.features)) {
         features = product.metadata.features;
       } else if (product?.metadata?.features_csv) {
-        features = product.metadata.features_csv.split(',').map((s) => s.trim()).filter(Boolean);
+        features = product.metadata.features_csv
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
       }
 
-      const popular = (product?.metadata?.popular || '').toString().toLowerCase() === 'true';
+      const popular =
+        (product?.metadata?.popular || '').toString().toLowerCase() === 'true';
 
       return {
         id: p.id,
@@ -84,8 +88,6 @@ async function createCheckoutSession({ priceId, mode, user }) {
 
   const session = await stripe.checkout.sessions.create(sessionParams);
 
-  // (Optional) If you didn’t have a customerId and want to guarantee one, you can
-  // create it up front and pass `customer` instead of `customer_email`.
   return session;
 }
 
@@ -116,8 +118,74 @@ async function createBillingPortalSession({ user }) {
   return portalSession;
 }
 
+/**
+ * Dynamic pay-per-visit Checkout Session based on Firestore location.price
+ * Used for guest "Confirm & Continue" on HomeScreen.
+ * params: { locationId, user }
+ */
+async function createLocationCheckoutSession({ locationId, user }) {
+  if (!locationId) {
+    throw new Error('locationId is required');
+  }
+
+  // 1. Load location from Firestore
+  const locRef = db.collection('locations').doc(locationId);
+  const snap = await locRef.get();
+
+  if (!snap.exists) {
+    throw new Error('Location not found');
+  }
+
+  const location = snap.data();
+  const locationName = location.name || 'Pay2Pee Bathroom';
+  const price = location.price; // e.g. 4.99
+
+  if (price == null) {
+    throw new Error('Location does not have a price set');
+  }
+
+  const amountInCents = Math.round(Number(price) * 100);
+
+  // 2. Build Stripe Checkout Session
+  const customerEmail = user?.email || undefined;
+  const stripeCustomerId = user?.stripeCustomerId || undefined;
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card'],
+    customer: stripeCustomerId,
+    customer_email: stripeCustomerId ? undefined : customerEmail,
+    line_items: [
+      {
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `Bathroom Pass - ${locationName}`,
+            metadata: {
+              locationId,
+            },
+          },
+          unit_amount: amountInCents,
+        },
+        quantity: 1,
+      },
+    ],
+    client_reference_id: user?.id || undefined,
+    metadata: {
+      locationId,
+      userId: user?.id || '',
+      type: 'pay_as_you_go',
+    },
+    success_url: `${process.env.CLIENT_URL}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${process.env.CLIENT_URL}/checkout-cancelled`,
+  });
+
+  return session;
+}
+
 module.exports = {
   listActivePrices,
   createCheckoutSession,
   createBillingPortalSession,
+  createLocationCheckoutSession,
 };

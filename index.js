@@ -98,7 +98,7 @@ app.use('/api/locations', require('./routes/locationRoutes'));
 app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
-app.use('/api/partner', require('./routes/partnerAnalytics'));
+app.use('/api/guest', require('./routes/guestVisitsRoutes'));
 
 // Partner routes — file exports { partnerRouter, hostRouter } OR a single router
 (() => {
@@ -115,11 +115,11 @@ app.use('/api/partner', require('./routes/partnerAnalytics'));
     // fallback if it’s just a single router export
     app.use('/api/partner', partnerModule);
   }
-  // Partner Analytics Route
-app.use('/api/partner', require('./routes/partnerAnalytics'));
+
+  // Mount analytics under the same /api/partner namespace
+  app.use('/api/partner', require('./routes/partnerAnalytics'));
 })();
 
-// When you’re ready for Stripe Connect:
 // app.use('/api/connect', require('./routes/connectRoutes'));
 
 /* --------------- Serve client (optional) ------------------ */
