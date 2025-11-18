@@ -5,16 +5,14 @@ const protect = require('../middleware/protect');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const router = express.Router();
+
 const usersCol = firestore.collection('users');
 const partnersCol = firestore.collection('partners');
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
 
-/**
- * Helper: get or create a Stripe Connect account for this partner.
- */
+// Helper: get/create a Connect account and store it on partners/{userId}
 async function getOrCreateConnectAccount(userId, emailHint) {
-  // 1. Look in partners collection first
   const partnerRef = partnersCol.doc(userId);
   const partnerSnap = await partnerRef.get();
   const partnerData = partnerSnap.exists ? partnerSnap.data() : {};
@@ -23,19 +21,19 @@ async function getOrCreateConnectAccount(userId, emailHint) {
     return partnerData.stripeAccountId;
   }
 
-  // 2. Resolve email: prefer explicit, then users collection
   let email = emailHint;
+
   if (!email) {
     const userSnap = await usersCol.doc(userId).get();
     if (userSnap.exists && userSnap.data().email) {
       email = userSnap.data().email;
     }
   }
+
   if (!email) {
     throw new Error('Email required to create Stripe account');
   }
 
-  // 3. Create Connect account (Express)
   const account = await stripe.accounts.create({
     type: 'express',
     email,
@@ -43,7 +41,6 @@ async function getOrCreateConnectAccount(userId, emailHint) {
     metadata: { userId },
   });
 
-  // 4. Persist on partners/{userId}
   await partnerRef.set(
     {
       stripeAccountId: account.id,
@@ -55,13 +52,7 @@ async function getOrCreateConnectAccount(userId, emailHint) {
   return account.id;
 }
 
-/**
- * POST /api/connect/create-account
- * Body: { partnerId?, email? }
- * Returns: { stripeAccountId }
- *
- * This is used by ensureConnectAccount() in PartnerHomeScreen.
- */
+// POST /api/connect/create-account
 router.post('/create-account', protect, async (req, res) => {
   try {
     const partnerId = req.body.partnerId || req.user.userId;
@@ -81,13 +72,7 @@ router.post('/create-account', protect, async (req, res) => {
   }
 });
 
-/**
- * POST /api/connect/onboard-link
- * Body: { partnerId? }
- * Returns: { url }
- *
- * This is used by startOnboarding() in PartnerHomeScreen.
- */
+// POST /api/connect/onboard-link
 router.post('/onboard-link', protect, async (req, res) => {
   try {
     const partnerId = req.body.partnerId || req.user.userId;
@@ -95,7 +80,6 @@ router.post('/onboard-link', protect, async (req, res) => {
       return res.status(400).json({ error: 'Missing partnerId/userId' });
     }
 
-    // Make sure an account exists (or create one)
     const partnerRef = partnersCol.doc(partnerId);
     const partnerSnap = await partnerRef.get();
     const partnerData = partnerSnap.exists ? partnerSnap.data() : {};
@@ -103,7 +87,6 @@ router.post('/onboard-link', protect, async (req, res) => {
     let accountId = partnerData.stripeAccountId;
 
     if (!accountId) {
-      // fallback create – same logic as create-account, but without emailHint
       accountId = await getOrCreateConnectAccount(partnerId, null);
     }
 

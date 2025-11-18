@@ -55,8 +55,10 @@ app.use('/stripe-webhooks', stripeWebhooks); // legacy alias if Stripe is pointe
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+/* ----------------- Route modules (imports) ---------------- */
 const connectRoutes = require('./routes/connectRoutes');
-app.use('/api/connect', connectRoutes);
+const { partnerRouter, hostRouter } = require('./routes/partnerRoutes');
+const partnerAnalyticsRoutes = require('./routes/partnerAnalytics');
 
 /* ---------------------- Healthcheck ----------------------- */
 app.get('/api/healthcheck', async (_req, res) => {
@@ -102,29 +104,16 @@ app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
 app.use('/api/guest', require('./routes/guestVisitsRoutes'));
-app.use('/api/connect', require('./routes/connectRoutes'));
 
-// Partner routes — file exports { partnerRouter, hostRouter } OR a single router
-(() => {
-  const partnerModule = require('./routes/partnerRoutes');
+// Stripe Connect (for partner onboarding / payouts)
+app.use('/api/connect', connectRoutes);
 
-  if (partnerModule && (partnerModule.partnerRouter || partnerModule.hostRouter)) {
-    if (partnerModule.partnerRouter) {
-      app.use('/api/partner', partnerModule.partnerRouter);
-    }
-    if (partnerModule.hostRouter) {
-      app.use('/api/host', partnerModule.hostRouter);
-    }
-  } else {
-    // fallback if it’s just a single router export
-    app.use('/api/partner', partnerModule);
-  }
+// Partner + Host routes
+app.use('/api/partner', partnerRouter);        // /api/partner/summary, /api/partner/onboard, etc.
+app.use('/api/host', hostRouter);              // /api/host/visibility, /api/host/auto-accept, /api/host/payout
 
-  // Mount analytics under the same /api/partner namespace
-  app.use('/api/partner', require('./routes/partnerAnalytics'));
-})();
-
-// app.use('/api/connect', require('./routes/connectRoutes'));
+// Partner analytics lives under /api/partner as well
+app.use('/api/partner', partnerAnalyticsRoutes);
 
 /* --------------- Serve client (optional) ------------------ */
 if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true') {
