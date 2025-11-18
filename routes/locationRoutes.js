@@ -1,4 +1,4 @@
-// routes/locationRoutes.js (Firestore, GeoPoint-friendly)
+// routes/locationRoutes.js (super simple, GeoPoint-safe)
 const express = require("express");
 const { body, validationResult } = require("express-validator");
 const { admin, firestore } = require("../firebase-admin");
@@ -8,56 +8,18 @@ const router = express.Router();
 const locationsCol = firestore.collection("locations");
 
 /* ─────────────────────────────────────────────
- * Distance helpers
- * ────────────────────────────────────────────*/
-const toRad = (value) => (value * Math.PI) / 180;
-
-const haversineKm = (lat1, lng1, lat2, lng2) => {
-  if (
-    typeof lat1 !== "number" ||
-    typeof lng1 !== "number" ||
-    typeof lat2 !== "number" ||
-    typeof lng2 !== "number"
-  ) {
-    return null;
-  }
-  const R = 6371; // km
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-};
-
-/* ─────────────────────────────────────────────
  * GET /api/locations/nearby
  *
- * Query:
- *   lat, lng   (optional) guest coordinates
- *   radiusKm   (optional) radius in km, default 5
- *
- * Works with coordinates stored as:
- *   - GeoPoint (coords.latitude / coords.longitude)
- *   - { lat, lng } plain object
+ * Query (optional):
+ *   lat, lng, radiusKm – IGNORED for now, we just return active locations.
  *
  * Returns:
- *   { locations: [ ... ] }
+ *   { locations: [ { id, ...doc.data() }, ... ] }
  * ────────────────────────────────────────────*/
 router.get("/nearby", async (req, res) => {
   try {
-    const lat = req.query.lat != null ? Number(req.query.lat) : null;
-    const lng = req.query.lng != null ? Number(req.query.lng) : null;
-    const radiusKm =
-      req.query.radiusKm != null ? Number(req.query.radiusKm) : 5;
+    console.log("GET /api/locations/nearby raw hit");
 
-    console.log("GET /api/locations/nearby", { lat, lng, radiusKm });
-
-    // Pull up to 200 active locations
     const snap = await locationsCol
       .where("isActive", "==", true)
       .limit(200)
@@ -65,80 +27,20 @@ router.get("/nearby", async (req, res) => {
 
     const locations = [];
     snap.forEach((doc) => {
-      const d = doc.data() || {};
-      const coords = d.coordinates;
-
-      // Support GeoPoint and { lat, lng }
-      let locLat = null;
-      let locLng = null;
-
-      if (coords) {
-        // GeoPoint or { latitude, longitude }
-        if (
-          typeof coords.latitude === "number" &&
-          typeof coords.longitude === "number"
-        ) {
-          locLat = coords.latitude;
-          locLng = coords.longitude;
-        }
-        // Plain { lat, lng }
-        else if (
-          typeof coords.lat === "number" &&
-          typeof coords.lng === "number"
-        ) {
-          locLat = coords.lat;
-          locLng = coords.lng;
-        }
+      try {
+        const data = doc.data() || {};
+        // Just spread everything, including GeoPoint, photos, etc.
+        locations.push({
+          id: doc.id,
+          ...data,
+        });
+      } catch (docErr) {
+        console.error(
+          `Error processing location doc ${doc.id}:`,
+          docErr?.message || docErr
+        );
       }
-
-      let distanceKm = null;
-      if (lat != null && lng != null && locLat != null && locLng != null) {
-        distanceKm = haversineKm(lat, lng, locLat, locLng);
-      }
-
-      // If we have guest coords & radius, filter out beyond radius
-      if (distanceKm != null && distanceKm > radiusKm) {
-        return; // skip this doc
-      }
-
-      locations.push({
-        id: doc.id,
-        name: d.name || d.address || "",
-        address: d.address || "",
-        price:
-          d.price != null
-            ? Number(d.price)
-            : d.pricing?.basePrice != null
-            ? Number(d.pricing.basePrice)
-            : null,
-        rating:
-          d.rating != null
-            ? Number(d.rating)
-            : d.rating?.average != null
-            ? Number(d.rating.average)
-            : null,
-        totalReviews: d.totalReviews || d.rating?.count || 0,
-        photoUrl:
-          d.photoUrl ||
-          (Array.isArray(d.photos) && d.photos.length > 0
-            ? d.photos[0].url || d.photos[0]
-            : ""),
-        accessCode: d.accessCode || "",
-        instructions: d.instructions || d.instructionsPreview || "",
-        coordinates: coords || null,
-        isActive: d.isActive !== false,
-        distanceKm,
-      });
     });
-
-    // Sort by distance when we know guest coords
-    if (lat != null && lng != null) {
-      locations.sort((a, b) => {
-        const da = typeof a.distanceKm === "number" ? a.distanceKm : 999999;
-        const db = typeof b.distanceKm === "number" ? b.distanceKm : 999999;
-        return da - db;
-      });
-    }
 
     return res.json({ locations });
   } catch (err) {
@@ -148,7 +50,7 @@ router.get("/nearby", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
- * Partner-facing routes (legacy but still useful)
+ * Partner-facing routes (unchanged)
  * ────────────────────────────────────────────*/
 
 /**
@@ -204,7 +106,7 @@ router.put(
       const payload = {
         owner: req.user.userId,
         address,
-        coordinates, // { latitude, longitude }
+        coordinates, // { latitude, longitude } or GeoPoint-like object
         pricing: {
           basePrice: pricing.basePrice,
           surgeMultiplier: pricing.surgeMultiplier || 1,
