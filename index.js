@@ -1,4 +1,4 @@
-// index.js — Pay2Pee Backend (Firestore + Stripe + Connect)
+// index.js — Pay2Pee Backend (Express + Firestore + Stripe)
 require('dotenv').config();
 
 const express = require('express');
@@ -6,137 +6,124 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 
-// Our centralized firebase helper
-const {
-  admin,
-  firestore,
-  bucket,
-  getFirebaseConfigInfo,
-  firestoreSmokeTest,
-} = require('./firebase-admin');
-
 const app = express();
 
-/* -------------------- Core middleware -------------------- */
-app.set('trust proxy', 1);
+/* ---------------------- CORS SETUP ------------------------ */
 
 const allowedOrigins = [
-  'https://pay2pee.app',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'https://pay2pee.app',
 ];
 
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, server-to-server)
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error('Not allowed by CORS'));
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-};
+app.use(
+  cors({
+    origin(origin, callback) {
+      // allow non-browser clients or same-origin
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      // If you want to hard-block unknown origins, return an error instead:
+      // return callback(new Error('Not allowed by CORS'));
+      return callback(null, false);
+    },
+    credentials: true,
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    allowedHeaders:
+      'Origin,X-Requested-With,Content-Type,Accept,Authorization',
+  })
+);
 
-// Apply CORS to all routes
-app.use(cors(corsOptions));
-// Ensure preflight (OPTIONS) also gets CORS headers
-app.options('*', cors(corsOptions));
+// Handle preflight for all routes
+app.options('*', cors());
 
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+/* -------------------- BASIC MIDDLEWARE -------------------- */
 
-/* ---------------- Stripe webhooks (RAW FIRST) ------------- */
-const stripeWebhooks = require('./routes/stripeWebhooksRoutes');
-app.use('/api/webhooks/stripe', stripeWebhooks);
-app.use('/stripe-webhooks', stripeWebhooks); // legacy alias if Stripe is pointed here
+app.use(morgan('dev'));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.set('trust proxy', 1); // because Render / proxies
 
-/* --------------- Body parsers (AFTER webhooks) ------------ */
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+/* ---------------------- API ROUTES ------------------------ */
 
-/* ----------------- Route modules (imports) ---------------- */
-const connectRoutes = require('./routes/connectRoutes');
-const { partnerRouter, hostRouter } = require('./routes/partnerRoutes');
-const partnerAnalyticsRoutes = require('./routes/partnerAnalytics');
+// Auth (login, register, etc)
+try {
+  const authRoutes = require('./routes/authRoutes');
+  app.use('/api/auth', authRoutes);
+} catch (err) {
+  console.warn('⚠️ Could not mount /api/auth routes:', err.message);
+}
 
-/* ---------------------- Healthcheck ----------------------- */
-app.get('/api/healthcheck', async (_req, res) => {
-  try {
-    await firestore.collection('_meta').limit(1).get();
-    res.json({
-      status: 'healthy',
-      serverTime: new Date().toISOString(),
-      dbStatus: 'connected',
-      firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
-    });
-  } catch (err) {
-    console.error('Healthcheck Firestore error:', err);
-    res.json({
-      status: 'degraded',
-      serverTime: new Date().toISOString(),
-      dbStatus: 'unreachable',
-      firebaseStatus: admin.apps.length ? 'connected' : 'disconnected',
-    });
+// Locations (guest home screen, nearby search)
+try {
+  const locationRoutes = require('./routes/locationRoutes');
+  app.use('/api/locations', locationRoutes);
+} catch (err) {
+  console.warn('⚠️ Could not mount /api/locations routes:', err.message);
+}
+
+// Payments (Stripe checkout, MyPass, subscriptions)
+try {
+  const paymentsRoutes = require('./routes/paymentsRoutes');
+  app.use('/api/payments', paymentsRoutes);
+} catch (err) {
+  console.warn('⚠️ Could not mount /api/payments routes:', err.message);
+}
+
+// Partner / Host routes (partner profile, visibility, analytics, payouts)
+try {
+  const partnerModule = require('./routes/partnerRoutes');
+  if (partnerModule.partnerRouter) {
+    app.use('/api/partner', partnerModule.partnerRouter);
+  } else if (typeof partnerModule === 'function') {
+    // in case file exports a single router
+    app.use('/api/partner', partnerModule);
   }
+
+  if (partnerModule.hostRouter) {
+    app.use('/api/host', partnerModule.hostRouter);
+  }
+} catch (err) {
+  console.warn('⚠️ Could not mount /api/partner or /api/host routes:', err.message);
+}
+
+/* ---------------------- HEALTHCHECK ----------------------- */
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    env: process.env.NODE_ENV || 'development',
+    time: new Date().toISOString(),
+  });
 });
 
-/* ----------------- Debug endpoints ------------------------ */
+/* --------------- Serve client (production) ---------------- */
 
-// Shows projectId, databaseId, bucket, and credential source
-app.get('/api/_debug/firebase', (_req, res) => {
-  res.json(getFirebaseConfigInfo());
-});
+// If you’re serving the React build from the same server:
+if (process.env.NODE_ENV === 'production') {
+  const clientBuildPath = path.join(__dirname, 'client', 'build');
+  app.use(express.static(clientBuildPath));
 
-// Actually touches Firestore and returns ok / error
-app.get('/api/_debug/fs-smoketest', async (_req, res) => {
-  const result = await firestoreSmokeTest();
-  res.json(result);
-});
-
-/* ------------------------ Routes -------------------------- */
-
-// Simple routers (each must export `module.exports = router`)
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/users', require('./routes/users'));
-app.use('/api/locations', require('./routes/locationRoutes'));
-app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
-app.use('/api/subscriptions', require('./routes/subscriptions'));
-app.use('/api/payments', require('./routes/paymentsRoutes'));
-app.use('/api/guest', require('./routes/guestVisitsRoutes'));
-
-// Stripe Connect (for partner onboarding / payouts)
-app.use('/api/connect', connectRoutes);
-
-// Partner + Host routes
-app.use('/api/partner', partnerRouter);        // /api/partner/summary, /api/partner/onboard, etc.
-app.use('/api/host', hostRouter);              // /api/host/visibility, /api/host/auto-accept, /api/host/payout
-
-// Partner analytics lives under /api/partner as well
-app.use('/api/partner', partnerAnalyticsRoutes);
-
-/* --------------- Serve client (optional) ------------------ */
-if (process.env.NODE_ENV === 'production' && process.env.SERVE_CLIENT === 'true') {
-  app.use(express.static(path.join(__dirname, 'client/build')));
-  app.get('*', (_req, res) => {
-    res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
+  app.get('*', (req, res) => {
+    // Let /api/* requests fall through to API handlers
+    if (req.path.startsWith('/api')) {
+      return res.status(404).json({ error: 'API route not found' });
+    }
+    res.sendFile(path.join(clientBuildPath, 'index.html'));
+  });
+} else {
+  app.get('/', (_req, res) => {
+    res.send('Pay2Pee API (development)');
   });
 }
 
-/* ---------------- 404 + Error handlers -------------------- */
-app.use((req, res) =>
-  res.status(404).json({ success: false, error: 'Endpoint not found' })
-);
+/* ---------------- API 404 (fallback) ---------------------- */
 
-app.use((err, _req, res, _next) => {
-  console.error('⚠️ Server Error:', err);
-  res.status(500).json({
-    success: false,
-    error: process.env.NODE_ENV === 'development' ? err.message : 'Server error',
-  });
+app.use('/api/*', (_req, res) => {
+  res.status(404).json({ error: 'API route not found' });
 });
 
 /* -------------------- Start server ------------------------ */
+
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`🚀 Pay2Pee server running on port ${PORT}`);
@@ -144,6 +131,7 @@ const server = app.listen(PORT, () => {
 });
 
 /* ------------------ Graceful shutdown --------------------- */
+
 process.on('SIGTERM', () => {
   console.log('SIGTERM received. Shutting down gracefully...');
   server.close(() => console.log('Process terminated'));

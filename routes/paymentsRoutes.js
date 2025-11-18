@@ -4,6 +4,7 @@ const { body, validationResult } = require('express-validator');
 const { protect } = require('../middleware/auth'); // assumes req.user = { id, email, stripeCustomerId? }
 const payments = require('../controllers/paymentsController');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { firestore, admin } = require('../firebase-admin');
 
 const router = express.Router();
 
@@ -162,6 +163,108 @@ router.get('/config', (_req, res) => {
       process.env.REACT_APP_STRIPE_PK ||
       '',
   });
+});
+
+/**
+ * GET /api/payments/guest/session/:sessionId
+ *
+ * Used by MyPass page:
+ *  - Verifies session with Stripe
+ *  - Creates a guestVisits document if not already created for this session
+ *  - Returns session, location, and visit info
+ */
+router.get('/guest/session/:sessionId', protect, async (req, res) => {
+  const { sessionId } = req.params;
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' });
+  }
+
+  try {
+    // 1) Fetch Checkout Session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent'],
+    });
+
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Optional: make sure the session is for this user
+    if (
+      session.customer_email &&
+      req.user.email &&
+      session.customer_email.toLowerCase() !== req.user.email.toLowerCase()
+    ) {
+      return res.status(403).json({ error: 'Session does not belong to this user' });
+    }
+
+    const metadata = session.metadata || {};
+    const locationId = metadata.locationId;
+    const userId = metadata.userId || req.user.id || req.user.userId;
+
+    if (!locationId) {
+      return res.status(400).json({ error: 'Session is missing locationId metadata' });
+    }
+
+    // 2) Fetch location info
+    const locRef = firestore.collection('locations').doc(locationId);
+    const locSnap = await locRef.get();
+
+    if (!locSnap.exists) {
+      return res.status(404).json({ error: 'Location not found for this pass' });
+    }
+
+    const location = { id: locSnap.id, ...locSnap.data() };
+
+    // 3) Create or fetch guest visit in Firestore
+    const guestVisitsCol = firestore.collection('guestVisits');
+
+    // Try to find an existing visit for this Stripe session
+    const existingVisitSnap = await guestVisitsCol
+      .where('stripeSessionId', '==', session.id)
+      .limit(1)
+      .get();
+
+    let visitDoc;
+    if (existingVisitSnap.empty) {
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      const visitData = {
+        stripeSessionId: session.id,
+        userId,
+        locationId,
+        status: session.payment_status === 'paid' ? 'active' : 'pending', // basic state for now
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const newRef = await guestVisitsCol.add(visitData);
+      const newSnap = await newRef.get();
+      visitDoc = { id: newRef.id, ...newSnap.data() };
+    } else {
+      const doc = existingVisitSnap.docs[0];
+      visitDoc = { id: doc.id, ...doc.data() };
+    }
+
+    return res.json({
+      session: {
+        id: session.id,
+        status: session.payment_status, // 'paid', 'unpaid', 'no_payment_required'
+        amountTotal: session.amount_total,
+        currency: session.currency,
+      },
+      location,
+      visit: visitDoc,
+    });
+  } catch (err) {
+    console.error('guest session lookup error:', err);
+    return res.status(500).json({
+      error: err.message || 'Failed to load session / pass details',
+    });
+  }
 });
 
 module.exports = router;
