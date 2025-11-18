@@ -8,72 +8,151 @@ const protect = require('../middleware/protect'); // your JWT middleware
 const router = express.Router();
 const locationsCol = firestore.collection('locations');
 
+/* ─────────────────────────────────────────────────────────────
+ * Helpers for distance
+ * ────────────────────────────────────────────────────────────*/
+const toRad = (value) => (value * Math.PI) / 180;
+
+const haversineKm = (lat1, lng1, lat2, lng2) => {
+  if (
+    typeof lat1 !== 'number' ||
+    typeof lng1 !== 'number' ||
+    typeof lat2 !== 'number' ||
+    typeof lng2 !== 'number'
+  ) {
+    return null;
+  }
+  const R = 6371; // km
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
 /**
- * GET /api/locations/nearby?lat=&lng=&radius=
+ * GET /api/locations/nearby
+ *
+ * Query params:
+ *   lat, lng (optional)  - guest coordinates
+ *   radiusKm (optional)  - radius in km (default 5)
+ *   radius   (optional)  - radius in meters (legacy, will be converted to km)
+ *
+ * Returns: { locations: [ ... ] }
+ *
+ * This version:
+ *  - DOES NOT require lat/lng (front-end can still call with just radiusKm),
+ *  - DOES NOT rely on geohash,
+ *  - Supports both coordinates.lat/lng and coordinates.latitude/longitude.
  */
 router.get(
   '/nearby',
   [
-    query('lat').isFloat({ min: -90, max: 90 }).withMessage('Latitude must be between -90 and 90'),
-    query('lng').isFloat({ min: -180, max: 180 }).withMessage('Longitude must be between -180 and 180'),
-    query('radius').optional().isInt({ min: 100, max: 10000 }).withMessage('Radius 100–10000 (meters)'),
+    // Make lat/lng optional but validated if present
+    query('lat').optional().isFloat({ min: -90, max: 90 }).withMessage('Latitude must be between -90 and 90'),
+    query('lng').optional().isFloat({ min: -180, max: 180 }).withMessage('Longitude must be between -180 and 180'),
+    query('radiusKm').optional().isFloat({ min: 0.1, max: 50 }),
+    query('radius').optional().isInt({ min: 100, max: 100000 }), // meters (legacy)
   ],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     try {
-      const lat = parseFloat(req.query.lat);
-      const lng = parseFloat(req.query.lng);
-      const radiusM = parseInt(req.query.radius || '1000', 10);
+      const lat = req.query.lat != null ? Number(req.query.lat) : null;
+      const lng = req.query.lng != null ? Number(req.query.lng) : null;
 
-      // geohash bounds
-      const radiusKm = radiusM / 1000;
-      const center = [lat, lng];
-      const bounds = geofire.geohashQueryBounds(center, radiusKm);
-      const promises = bounds.map(([start, end]) =>
-        locationsCol
-          .orderBy('geohash')
-          .startAt(start)
-          .endAt(end)
-          .get()
-      );
+      // Prefer radiusKm; fall back to radius (meters) if provided; else default
+      let radiusKm = 5;
+      if (req.query.radiusKm != null) {
+        radiusKm = Number(req.query.radiusKm);
+      } else if (req.query.radius != null) {
+        radiusKm = Number(req.query.radius) / 1000;
+      }
 
-      const snapshots = await Promise.all(promises);
-      const candidates = [];
-      snapshots.forEach(snap =>
-        snap.forEach(doc => {
-          const d = doc.data();
-          if (d.isActive) {
-            const distance = geofire.distanceBetween(center, [d.coordinates.latitude, d.coordinates.longitude]) * 1000;
-            if (distance <= radiusM) {
-              candidates.push({
-                id: doc.id,
-                name: d.name || d.address,
-                address: d.address,
-                lat: d.coordinates.latitude,
-                lng: d.coordinates.longitude,
-                price: d.pricing?.basePrice ?? 0,
-                rating: d.rating?.average ?? 4.8,
-                review_count: d.rating?.count ?? 0,
-                cleanliness: d.cleanliness || 'A',
-                is_open: d.isActive,
-                features: d.amenities || [],
-                image_url: d.photos?.[0]?.url || '',
-                distance_text: `${Math.round(distance)} m`,
-                instructions_preview: d.instructionsPreview || '',
-              });
-            }
+      // Fetch up to 200 active locations
+      const snap = await locationsCol.where('isActive', '==', true).limit(200).get();
+
+      const locations = [];
+      snap.forEach((doc) => {
+        const d = doc.data() || {};
+        const coords = d.coordinates;
+
+        // Support both { lat, lng } and { latitude, longitude }
+        let locLat = null;
+        let locLng = null;
+        if (coords) {
+          if (typeof coords.lat === 'number' && typeof coords.lng === 'number') {
+            locLat = coords.lat;
+            locLng = coords.lng;
+          } else if (
+            typeof coords.latitude === 'number' &&
+            typeof coords.longitude === 'number'
+          ) {
+            locLat = coords.latitude;
+            locLng = coords.longitude;
           }
-        })
-      );
+        }
 
-      // sort by distance
-      candidates.sort((a, b) => parseInt(a.distance_text) - parseInt(b.distance_text));
-      res.json({ locations: candidates });
+        let distanceKm = null;
+        if (lat != null && lng != null && locLat != null && locLng != null) {
+          distanceKm = haversineKm(lat, lng, locLat, locLng);
+        }
+
+        // If we have guest coords and radius, filter out beyond radius
+        if (distanceKm != null && distanceKm > radiusKm) {
+          return;
+        }
+
+        locations.push({
+          id: doc.id,
+          name: d.name || d.address || '',
+          address: d.address || '',
+          // Price: support both new price and old pricing.basePrice
+          price:
+            d.price != null
+              ? Number(d.price)
+              : d.pricing?.basePrice != null
+              ? Number(d.pricing.basePrice)
+              : null,
+          rating:
+            d.rating != null
+              ? Number(d.rating)
+              : d.rating?.average != null
+              ? Number(d.rating.average)
+              : null,
+          totalReviews: d.totalReviews || d.rating?.count || 0,
+          photoUrl:
+            d.photoUrl ||
+            (Array.isArray(d.photos) && d.photos.length > 0
+              ? d.photos[0].url || d.photos[0]
+              : ''),
+          accessCode: d.accessCode || '',
+          instructions: d.instructions || d.instructionsPreview || '',
+          coordinates: coords || null,
+          isActive: d.isActive !== false,
+          distanceKm,
+        });
+      });
+
+      // If we have guest coords, sort by distance
+      if (lat != null && lng != null) {
+        locations.sort((a, b) => {
+          const da = typeof a.distanceKm === 'number' ? a.distanceKm : 999999;
+          const db = typeof b.distanceKm === 'number' ? b.distanceKm : 999999;
+          return da - db;
+        });
+      }
+
+      return res.json({ locations });
     } catch (err) {
       console.error('Nearby locations error:', err);
-      res.status(500).json({ error: 'Server error' });
+      return res.status(500).json({ error: 'Server error' });
     }
   }
 );
@@ -94,6 +173,7 @@ router.get('/me', protect, async (req, res) => {
 
 /**
  * PUT /api/locations/me (partner)
+ * (legacy path that uses GeoFire + coordinates.latitude/longitude)
  */
 router.put(
   '/me',
@@ -122,7 +202,10 @@ router.put(
       } = req.body;
 
       // compute geohash
-      const geohash = geofire.geohashForLocation([coordinates.latitude, coordinates.longitude]);
+      const geohash = geofire.geohashForLocation([
+        coordinates.latitude,
+        coordinates.longitude,
+      ]);
 
       // find or create by owner
       const snap = await locationsCol.where('owner', '==', req.user.userId).limit(1).get();
@@ -130,7 +213,10 @@ router.put(
         owner: req.user.userId,
         address,
         coordinates,
-        pricing: { basePrice: pricing.basePrice, surgeMultiplier: pricing.surgeMultiplier || 1 },
+        pricing: {
+          basePrice: pricing.basePrice,
+          surgeMultiplier: pricing.surgeMultiplier || 1,
+        },
         amenities,
         isPublic,
         isActive,
