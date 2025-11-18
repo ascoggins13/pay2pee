@@ -2,15 +2,15 @@
 const express = require('express');
 const { query, body, validationResult } = require('express-validator');
 const geofire = require('geofire-common');
-const { admin, firestore } = require('../firebase-admin'); // path from that file
-const protect = require('../middleware/protect'); // your JWT middleware
+const { admin, firestore } = require('../firebase-admin');
+const protect = require('../middleware/protect');
 
 const router = express.Router();
 const locationsCol = firestore.collection('locations');
 
-/* ─────────────────────────────────────────────────────────────
- * Helpers for distance
- * ────────────────────────────────────────────────────────────*/
+/* ─────────────────────────────────────────────
+ * Distance helpers
+ * ────────────────────────────────────────────*/
 const toRad = (value) => (value * Math.PI) / 180;
 
 const haversineKm = (lat1, lng1, lat2, lng2) => {
@@ -35,39 +35,41 @@ const haversineKm = (lat1, lng1, lat2, lng2) => {
   return R * c;
 };
 
-/**
+/* ─────────────────────────────────────────────
  * GET /api/locations/nearby
  *
- * Query params:
- *   lat, lng (optional)  - guest coordinates
- *   radiusKm (optional)  - radius in km (default 5)
- *   radius   (optional)  - radius in meters (legacy, will be converted to km)
+ * Query:
+ *   lat, lng      (optional) guest coordinates
+ *   radiusKm      (optional) radius in km, default 5
+ *   radius        (optional) legacy radius in meters -> converted to km
  *
- * Returns: { locations: [ ... ] }
+ * Returns:
+ *   { locations: [ { id, name, address, price, rating, photoUrl,
+ *                    coordinates, distanceKm, ... } ] }
  *
- * This version:
- *  - DOES NOT require lat/lng (front-end can still call with just radiusKm),
- *  - DOES NOT rely on geohash,
- *  - Supports both coordinates.lat/lng and coordinates.latitude/longitude.
- */
+ * Works with coordinates stored as:
+ *   - GeoPoint (coordinates.latitude / coordinates.longitude)
+ *   - { lat, lng } plain object
+ * ────────────────────────────────────────────*/
 router.get(
   '/nearby',
   [
-    // Make lat/lng optional but validated if present
-    query('lat').optional().isFloat({ min: -90, max: 90 }).withMessage('Latitude must be between -90 and 90'),
-    query('lng').optional().isFloat({ min: -180, max: 180 }).withMessage('Longitude must be between -180 and 180'),
+    query('lat').optional().isFloat({ min: -90, max: 90 }),
+    query('lng').optional().isFloat({ min: -180, max: 180 }),
     query('radiusKm').optional().isFloat({ min: 0.1, max: 50 }),
     query('radius').optional().isInt({ min: 100, max: 100000 }), // meters (legacy)
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
 
     try {
       const lat = req.query.lat != null ? Number(req.query.lat) : null;
       const lng = req.query.lng != null ? Number(req.query.lng) : null;
 
-      // Prefer radiusKm; fall back to radius (meters) if provided; else default
+      // Prefer radiusKm, fall back to radius (meters) or default 5km
       let radiusKm = 5;
       if (req.query.radiusKm != null) {
         radiusKm = Number(req.query.radiusKm);
@@ -75,7 +77,7 @@ router.get(
         radiusKm = Number(req.query.radius) / 1000;
       }
 
-      // Fetch up to 200 active locations
+      // Pull up to 200 active locations
       const snap = await locationsCol.where('isActive', '==', true).limit(200).get();
 
       const locations = [];
@@ -83,19 +85,23 @@ router.get(
         const d = doc.data() || {};
         const coords = d.coordinates;
 
-        // Support both { lat, lng } and { latitude, longitude }
+        // Support GeoPoint and { lat, lng }
         let locLat = null;
         let locLng = null;
         if (coords) {
-          if (typeof coords.lat === 'number' && typeof coords.lng === 'number') {
-            locLat = coords.lat;
-            locLng = coords.lng;
-          } else if (
+          // GeoPoint or GeoPoint-like { latitude, longitude }
+          if (
             typeof coords.latitude === 'number' &&
             typeof coords.longitude === 'number'
           ) {
             locLat = coords.latitude;
             locLng = coords.longitude;
+          } else if (
+            typeof coords.lat === 'number' &&
+            typeof coords.lng === 'number'
+          ) {
+            locLat = coords.lat;
+            locLng = coords.lng;
           }
         }
 
@@ -104,16 +110,15 @@ router.get(
           distanceKm = haversineKm(lat, lng, locLat, locLng);
         }
 
-        // If we have guest coords and radius, filter out beyond radius
+        // If we have guest coords and radius, filter by radius
         if (distanceKm != null && distanceKm > radiusKm) {
-          return;
+          return; // skip this doc
         }
 
         locations.push({
           id: doc.id,
           name: d.name || d.address || '',
           address: d.address || '',
-          // Price: support both new price and old pricing.basePrice
           price:
             d.price != null
               ? Number(d.price)
@@ -140,7 +145,7 @@ router.get(
         });
       });
 
-      // If we have guest coords, sort by distance
+      // Sort by distance if we know guest coords
       if (lat != null && lng != null) {
         locations.sort((a, b) => {
           const da = typeof a.distanceKm === 'number' ? a.distanceKm : 999999;
@@ -157,13 +162,22 @@ router.get(
   }
 );
 
+/* ─────────────────────────────────────────────
+ * Partner-facing routes (legacy + still useful)
+ * ────────────────────────────────────────────*/
+
 /**
  * GET /api/locations/me (partner)
  */
 router.get('/me', protect, async (req, res) => {
   try {
-    const snap = await locationsCol.where('owner', '==', req.user.userId).limit(1).get();
+    const snap = await locationsCol
+      .where('owner', '==', req.user.userId)
+      .limit(1)
+      .get();
+
     if (snap.empty) return res.status(404).json({ error: 'Location not found' });
+
     res.json({ id: snap.docs[0].id, ...snap.docs[0].data() });
   } catch (e) {
     console.error('Get location error:', e);
@@ -173,7 +187,7 @@ router.get('/me', protect, async (req, res) => {
 
 /**
  * PUT /api/locations/me (partner)
- * (legacy path that uses GeoFire + coordinates.latitude/longitude)
+ * Legacy path that uses GeoFire + coordinates.latitude/longitude
  */
 router.put(
   '/me',
@@ -201,18 +215,20 @@ router.put(
         isActive = false,
       } = req.body;
 
-      // compute geohash
       const geohash = geofire.geohashForLocation([
         coordinates.latitude,
         coordinates.longitude,
       ]);
 
-      // find or create by owner
-      const snap = await locationsCol.where('owner', '==', req.user.userId).limit(1).get();
+      const snap = await locationsCol
+        .where('owner', '==', req.user.userId)
+        .limit(1)
+        .get();
+
       const payload = {
         owner: req.user.userId,
         address,
-        coordinates,
+        coordinates, // this will be an object {latitude, longitude}
         pricing: {
           basePrice: pricing.basePrice,
           surgeMultiplier: pricing.surgeMultiplier || 1,
@@ -251,7 +267,10 @@ router.post('/me/photos', protect, [body('url').isURL()], async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   try {
-    const snap = await locationsCol.where('owner', '==', req.user.userId).limit(1).get();
+    const snap = await locationsCol
+      .where('owner', '==', req.user.userId)
+      .limit(1)
+      .get();
     if (snap.empty) return res.status(404).json({ error: 'Location not found' });
 
     const ref = snap.docs[0].ref;
@@ -275,22 +294,30 @@ router.post('/me/photos', protect, [body('url').isURL()], async (req, res) => {
 /**
  * PUT /api/locations/me/status (partner)
  */
-router.put('/me/status', protect, [body('isActive').isBoolean()], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+router.put(
+  '/me/status',
+  protect,
+  [body('isActive').isBoolean()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  try {
-    const snap = await locationsCol.where('owner', '==', req.user.userId).limit(1).get();
-    if (snap.empty) return res.status(404).json({ error: 'Location not found' });
+    try {
+      const snap = await locationsCol
+        .where('owner', '==', req.user.userId)
+        .limit(1)
+        .get();
+      if (snap.empty) return res.status(404).json({ error: 'Location not found' });
 
-    const ref = snap.docs[0].ref;
-    await ref.set({ isActive: req.body.isActive }, { merge: true });
-    const updated = await ref.get();
-    res.json({ id: ref.id, ...updated.data() });
-  } catch (e) {
-    console.error('Update status error:', e);
-    res.status(500).json({ error: 'Server error' });
+      const ref = snap.docs[0].ref;
+      await ref.set({ isActive: req.body.isActive }, { merge: true });
+      const updated = await ref.get();
+      res.json({ id: ref.id, ...updated.data() });
+    } catch (e) {
+      console.error('Update status error:', e);
+      res.status(500).json({ error: 'Server error' });
+    }
   }
-});
+);
 
 module.exports = router;
