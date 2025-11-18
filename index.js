@@ -102,6 +102,7 @@ app.use('/api/bathrooms', require('./routes/bathroomImageRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/payments', require('./routes/paymentsRoutes'));
 app.use('/api/guest', require('./routes/guestVisitsRoutes'));
+app.use('/api/connect', require('./routes/connectRoutes'));
 
 // Partner routes — file exports { partnerRouter, hostRouter } OR a single router
 (() => {
