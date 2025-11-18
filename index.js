@@ -19,11 +19,10 @@ const allowedOrigins = [
 app.use(
   cors({
     origin(origin, callback) {
-      // allow non-browser clients or same-origin
+      // allow same-origin / non-browser clients
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
-      // If you want to hard-block unknown origins, return an error instead:
-      // return callback(new Error('Not allowed by CORS'));
+      // you can hard-block unknown origins by returning an error here instead
       return callback(null, false);
     },
     credentials: true,
@@ -33,7 +32,7 @@ app.use(
   })
 );
 
-// Handle preflight for all routes
+// Handle preflight
 app.options('*', cors());
 
 /* -------------------- BASIC MIDDLEWARE -------------------- */
@@ -41,49 +40,29 @@ app.options('*', cors());
 app.use(morgan('dev'));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
-app.set('trust proxy', 1); // because Render / proxies
+app.set('trust proxy', 1); // Render / proxies
 
 /* ---------------------- API ROUTES ------------------------ */
 
-// Auth (login, register, etc)
-try {
-  const authRoutes = require('./routes/authRoutes');
-  app.use('/api/auth', authRoutes);
-} catch (err) {
-  console.warn('⚠️ Could not mount /api/auth routes:', err.message);
+// ✅ AUTH: this matches your original setup: routes/auth.js
+const authRoutes = require('./routes/auth');
+app.use('/api/auth', authRoutes);
+
+// LOCATIONS (guest map / nearby)
+const locationRoutes = require('./routes/locationRoutes');
+app.use('/api/locations', locationRoutes);
+
+// PAYMENTS (Stripe checkout, MyPass, subscriptions)
+const paymentsRoutes = require('./routes/paymentsRoutes');
+app.use('/api/payments', paymentsRoutes);
+
+// PARTNER / HOST (partner profile, visibility, analytics, payouts)
+const partnerModule = require('./routes/partnerRoutes');
+if (partnerModule.partnerRouter) {
+  app.use('/api/partner', partnerModule.partnerRouter);
 }
-
-// Locations (guest home screen, nearby search)
-try {
-  const locationRoutes = require('./routes/locationRoutes');
-  app.use('/api/locations', locationRoutes);
-} catch (err) {
-  console.warn('⚠️ Could not mount /api/locations routes:', err.message);
-}
-
-// Payments (Stripe checkout, MyPass, subscriptions)
-try {
-  const paymentsRoutes = require('./routes/paymentsRoutes');
-  app.use('/api/payments', paymentsRoutes);
-} catch (err) {
-  console.warn('⚠️ Could not mount /api/payments routes:', err.message);
-}
-
-// Partner / Host routes (partner profile, visibility, analytics, payouts)
-try {
-  const partnerModule = require('./routes/partnerRoutes');
-  if (partnerModule.partnerRouter) {
-    app.use('/api/partner', partnerModule.partnerRouter);
-  } else if (typeof partnerModule === 'function') {
-    // in case file exports a single router
-    app.use('/api/partner', partnerModule);
-  }
-
-  if (partnerModule.hostRouter) {
-    app.use('/api/host', partnerModule.hostRouter);
-  }
-} catch (err) {
-  console.warn('⚠️ Could not mount /api/partner or /api/host routes:', err.message);
+if (partnerModule.hostRouter) {
+  app.use('/api/host', partnerModule.hostRouter);
 }
 
 /* ---------------------- HEALTHCHECK ----------------------- */
@@ -98,13 +77,11 @@ app.get('/api/health', (_req, res) => {
 
 /* --------------- Serve client (production) ---------------- */
 
-// If you’re serving the React build from the same server:
 if (process.env.NODE_ENV === 'production') {
   const clientBuildPath = path.join(__dirname, 'client', 'build');
   app.use(express.static(clientBuildPath));
 
   app.get('*', (req, res) => {
-    // Let /api/* requests fall through to API handlers
     if (req.path.startsWith('/api')) {
       return res.status(404).json({ error: 'API route not found' });
     }
