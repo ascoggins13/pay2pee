@@ -123,7 +123,7 @@ router.post(
           userId: req.user.id || req.user.userId || '',
         },
         success_url: `${process.env.CLIENT_URL}/mypass?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.CLIENT_URL}/`,
+        cancel_url: `${process.env.CLIENT_URL}/#/`,
       });
 
       res.json({ sessionId: session.id, url: session.url });
