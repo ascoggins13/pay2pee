@@ -1,6 +1,6 @@
-// routes/locationRoutes.js (Firestore)
+// routes/locationRoutes.js (Firestore, GeoPoint-friendly)
 const express = require("express");
-const { query, body, validationResult } = require("express-validator");
+const { body, validationResult } = require("express-validator");
 const { admin, firestore } = require("../firebase-admin");
 const protect = require("../middleware/protect");
 
@@ -38,133 +38,117 @@ const haversineKm = (lat1, lng1, lat2, lng2) => {
  * GET /api/locations/nearby
  *
  * Query:
- *   lat, lng      (optional) guest coordinates
- *   radiusKm      (optional) radius in km, default 5
+ *   lat, lng   (optional) guest coordinates
+ *   radiusKm   (optional) radius in km, default 5
  *
  * Works with coordinates stored as:
- *   - GeoPoint (coordinates.latitude / coordinates.longitude)
+ *   - GeoPoint (coords.latitude / coords.longitude)
  *   - { lat, lng } plain object
  *
  * Returns:
  *   { locations: [ ... ] }
  * ────────────────────────────────────────────*/
-router.get(
-  "/nearby",
-  [
-    // keep validation light & optional
-    query("lat").optional().isFloat({ min: -90, max: 90 }),
-    query("lng").optional().isFloat({ min: -180, max: 180 }),
-    query("radiusKm").optional().isFloat({ min: 0.1, max: 50 }),
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      console.warn("Nearby validation errors:", errors.array());
-      // still return 400 so we can see what's wrong when debugging
-      return res.status(400).json({ errors: errors.array() });
-    }
+router.get("/nearby", async (req, res) => {
+  try {
+    const lat = req.query.lat != null ? Number(req.query.lat) : null;
+    const lng = req.query.lng != null ? Number(req.query.lng) : null;
+    const radiusKm =
+      req.query.radiusKm != null ? Number(req.query.radiusKm) : 5;
 
-    try {
-      const lat = req.query.lat != null ? Number(req.query.lat) : null;
-      const lng = req.query.lng != null ? Number(req.query.lng) : null;
-      const radiusKm =
-        req.query.radiusKm != null ? Number(req.query.radiusKm) : 5;
+    console.log("GET /api/locations/nearby", { lat, lng, radiusKm });
 
-      console.log("GET /api/locations/nearby", { lat, lng, radiusKm });
+    // Pull up to 200 active locations
+    const snap = await locationsCol
+      .where("isActive", "==", true)
+      .limit(200)
+      .get();
 
-      // Pull up to 200 active locations
-      const snap = await locationsCol
-        .where("isActive", "==", true)
-        .limit(200)
-        .get();
+    const locations = [];
+    snap.forEach((doc) => {
+      const d = doc.data() || {};
+      const coords = d.coordinates;
 
-      const locations = [];
-      snap.forEach((doc) => {
-        const d = doc.data() || {};
-        const coords = d.coordinates;
+      // Support GeoPoint and { lat, lng }
+      let locLat = null;
+      let locLng = null;
 
-        // Support GeoPoint and { lat, lng }
-        let locLat = null;
-        let locLng = null;
-
-        if (coords) {
-          // GeoPoint or `{ latitude, longitude }`
-          if (
-            typeof coords.latitude === "number" &&
-            typeof coords.longitude === "number"
-          ) {
-            locLat = coords.latitude;
-            locLng = coords.longitude;
-          }
-          // Plain object `{ lat, lng }`
-          else if (
-            typeof coords.lat === "number" &&
-            typeof coords.lng === "number"
-          ) {
-            locLat = coords.lat;
-            locLng = coords.lng;
-          }
+      if (coords) {
+        // GeoPoint or { latitude, longitude }
+        if (
+          typeof coords.latitude === "number" &&
+          typeof coords.longitude === "number"
+        ) {
+          locLat = coords.latitude;
+          locLng = coords.longitude;
         }
-
-        let distanceKm = null;
-        if (lat != null && lng != null && locLat != null && locLng != null) {
-          distanceKm = haversineKm(lat, lng, locLat, locLng);
+        // Plain { lat, lng }
+        else if (
+          typeof coords.lat === "number" &&
+          typeof coords.lng === "number"
+        ) {
+          locLat = coords.lat;
+          locLng = coords.lng;
         }
-
-        // If we have guest coords and radius, filter by radius
-        if (distanceKm != null && distanceKm > radiusKm) {
-          return; // skip this doc
-        }
-
-        locations.push({
-          id: doc.id,
-          name: d.name || d.address || "",
-          address: d.address || "",
-          price:
-            d.price != null
-              ? Number(d.price)
-              : d.pricing?.basePrice != null
-              ? Number(d.pricing.basePrice)
-              : null,
-          rating:
-            d.rating != null
-              ? Number(d.rating)
-              : d.rating?.average != null
-              ? Number(d.rating.average)
-              : null,
-          totalReviews: d.totalReviews || d.rating?.count || 0,
-          photoUrl:
-            d.photoUrl ||
-            (Array.isArray(d.photos) && d.photos.length > 0
-              ? d.photos[0].url || d.photos[0]
-              : ""),
-          accessCode: d.accessCode || "",
-          instructions: d.instructions || d.instructionsPreview || "",
-          coordinates: coords || null,
-          isActive: d.isActive !== false,
-          distanceKm,
-        });
-      });
-
-      // Sort by distance if we know guest coords
-      if (lat != null && lng != null) {
-        locations.sort((a, b) => {
-          const da = typeof a.distanceKm === "number" ? a.distanceKm : 999999;
-          const db = typeof b.distanceKm === "number" ? b.distanceKm : 999999;
-          return da - db;
-        });
       }
 
-      return res.json({ locations });
-    } catch (err) {
-      console.error("Nearby locations error:", err);
-      return res.status(500).json({ error: "Server error" });
+      let distanceKm = null;
+      if (lat != null && lng != null && locLat != null && locLng != null) {
+        distanceKm = haversineKm(lat, lng, locLat, locLng);
+      }
+
+      // If we have guest coords & radius, filter out beyond radius
+      if (distanceKm != null && distanceKm > radiusKm) {
+        return; // skip this doc
+      }
+
+      locations.push({
+        id: doc.id,
+        name: d.name || d.address || "",
+        address: d.address || "",
+        price:
+          d.price != null
+            ? Number(d.price)
+            : d.pricing?.basePrice != null
+            ? Number(d.pricing.basePrice)
+            : null,
+        rating:
+          d.rating != null
+            ? Number(d.rating)
+            : d.rating?.average != null
+            ? Number(d.rating.average)
+            : null,
+        totalReviews: d.totalReviews || d.rating?.count || 0,
+        photoUrl:
+          d.photoUrl ||
+          (Array.isArray(d.photos) && d.photos.length > 0
+            ? d.photos[0].url || d.photos[0]
+            : ""),
+        accessCode: d.accessCode || "",
+        instructions: d.instructions || d.instructionsPreview || "",
+        coordinates: coords || null,
+        isActive: d.isActive !== false,
+        distanceKm,
+      });
+    });
+
+    // Sort by distance when we know guest coords
+    if (lat != null && lng != null) {
+      locations.sort((a, b) => {
+        const da = typeof a.distanceKm === "number" ? a.distanceKm : 999999;
+        const db = typeof b.distanceKm === "number" ? b.distanceKm : 999999;
+        return da - db;
+      });
     }
+
+    return res.json({ locations });
+  } catch (err) {
+    console.error("GET /locations/nearby error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
-);
+});
 
 /* ─────────────────────────────────────────────
- * Partner-facing routes (kept for compatibility)
+ * Partner-facing routes (legacy but still useful)
  * ────────────────────────────────────────────*/
 
 /**
@@ -188,7 +172,7 @@ router.get("/me", protect, async (req, res) => {
 
 /**
  * PUT /api/locations/me (partner)
- * Legacy path that expects coordinates.latitude / coordinates.longitude
+ * Expects coordinates like { latitude, longitude }
  */
 router.put(
   "/me",
@@ -326,4 +310,3 @@ router.put(
 );
 
 module.exports = router;
-
