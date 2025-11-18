@@ -1,74 +1,70 @@
 // routes/connectRoutes.js
 const express = require('express');
-const router = express.Router();
+const { protect } = require('../middleware/auth'); // or your protect
+const admin = require('firebase-admin');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const { admin, firestore } = require('../firebase-admin'); // path from that file
-const db = admin.firestore();
 
-// Create a Stripe Express account for the partner
-router.post('/create-account', async (req, res) => {
+const db = admin.firestore();
+const router = express.Router();
+
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+
+/**
+ * POST /api/connect/onboard-link
+ * Body: { partnerId, email }
+ * Returns: { url }
+ */
+router.post('/onboard-link', protect, async (req, res) => {
   try {
     const { partnerId, email } = req.body;
-    if (!partnerId || !email)
-      return res.status(400).json({ error: 'partnerId and email are required' });
 
-    const partnerRef = db.collection('partners').doc(partnerId);
-    const partnerSnap = await partnerRef.get();
-
-    // If already has an account, return it
-    if (partnerSnap.exists && partnerSnap.data().stripeAccountId) {
-      return res.json({
-        stripeAccountId: partnerSnap.data().stripeAccountId,
-        already: true,
-      });
+    // You can also trust req.user.userId instead of partnerId, if you prefer
+    const userId = partnerId || req.user.userId;
+    if (!userId) {
+      return res.status(400).json({ error: 'Missing partnerId/userId' });
     }
 
-    const account = await stripe.accounts.create({
-      type: 'express',
-      email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-    });
+    // Load partner user from Firestore (adjust collection name if different)
+    const userRef = db.collection('users').doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return res.status(404).json({ error: 'Partner user not found' });
+    }
 
-    await partnerRef.set(
-      { stripeAccountId: account.id, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true }
-    );
+    const user = userSnap.data();
 
-    res.json({ stripeAccountId: account.id });
-  } catch (error) {
-    console.error('Error creating Connect account:', error);
-    res.status(500).json({ error: 'Failed to create account' });
-  }
-});
+    // 1. Reuse existing Stripe account if available
+    let accountId = user.stripeAccountId;
 
-// Generate URL to start Stripe onboarding
-router.post('/onboard-link', async (req, res) => {
-  try {
-    const { partnerId } = req.body;
-    if (!partnerId) return res.status(400).json({ error: 'partnerId required' });
+    // 2. If no account yet, create one
+    if (!accountId) {
+      const account = await stripe.accounts.create({
+        type: 'express',
+        email: email || user.email,
+        business_type: 'individual',
+        metadata: {
+          userId,
+        },
+      });
 
-    const partnerSnap = await db.collection('partners').doc(partnerId).get();
-    if (!partnerSnap.exists)
-      return res.status(404).json({ error: 'Partner not found' });
+      accountId = account.id;
 
-    const { stripeAccountId } = partnerSnap.data();
-    if (!stripeAccountId)
-      return res.status(400).json({ error: 'Partner needs a Stripe account first' });
+      // Save account id back to Firestore
+      await userRef.set({ stripeAccountId: accountId }, { merge: true });
+    }
 
+    // 3. Create an onboarding link for this account
     const accountLink = await stripe.accountLinks.create({
-      account: stripeAccountId,
-      refresh_url: `${process.env.CLIENT_URL}/partner/onboarding?retry=1`,
-      return_url: `${process.env.CLIENT_URL}/partner/onboarding/complete`,
+      account: accountId,
+      refresh_url: `${CLIENT_URL}/#/partner`, // where to send them if they abandon/refresh
+      return_url: `${CLIENT_URL}/#/partner`,  // where to send after completing onboarding
       type: 'account_onboarding',
     });
 
-    res.json({ url: accountLink.url });
-  } catch (error) {
-    console.error('Error creating onboarding link:', error);
-    res.status(500).json({ error: 'Failed to create onboarding link' });
+    return res.json({ url: accountLink.url });
+  } catch (err) {
+    console.error('Stripe onboarding link error:', err);
+    return res.status(500).json({ error: 'Failed to create onboarding link' });
   }
 });
 

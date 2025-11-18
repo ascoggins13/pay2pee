@@ -55,6 +55,9 @@ app.use('/stripe-webhooks', stripeWebhooks); // legacy alias if Stripe is pointe
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+const connectRoutes = require('./routes/connectRoutes');
+app.use('/api/connect', connectRoutes);
+
 /* ---------------------- Healthcheck ----------------------- */
 app.get('/api/healthcheck', async (_req, res) => {
   try {
