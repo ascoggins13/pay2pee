@@ -44,7 +44,13 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       rating: loc?.rating?.average ?? 4.8,
       reviews: Array.isArray(loc?.recentReviews) ? loc.recentReviews : [],
       trafficByDay: loc?.trafficByDay || {
-        Monday: 0, Tuesday: 0, Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0, Sunday: 0
+        Monday: 0,
+        Tuesday: 0,
+        Wednesday: 0,
+        Thursday: 0,
+        Friday: 0,
+        Saturday: 0,
+        Sunday: 0,
       },
       activeGuests: Array.isArray(loc?.activeGuests) ? loc.activeGuests : [],
       locationDetails: {
@@ -52,7 +58,9 @@ partnerRouter.get('/summary', protect, async (req, res) => {
         accessCode: loc?.accessCode || '—',
         hours: loc?.hours || '—',
         features: Array.isArray(loc?.amenities) ? loc.amenities : [],
-        photos: Array.isArray(loc?.photos) ? loc.photos.map(p => p.url || p) : [],
+        photos: Array.isArray(loc?.photos)
+          ? loc.photos.map((p) => p.url || p)
+          : [],
       },
       ownerName: partner?.ownerName || req.user.email?.split('@')[0] || 'Partner',
       avatarUrl: partner?.avatarUrl || '',
@@ -64,6 +72,40 @@ partnerRouter.get('/summary', protect, async (req, res) => {
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
+/**
+ * PUT /api/partner/visibility
+ * Toggle partner listing active/pause (same logic as /api/host/visibility,
+ * but under /partner so the UI can call it directly).
+ */
+partnerRouter.put(
+  '/visibility',
+  protect,
+  [body('isActive').isBoolean()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const userId = req.user.userId;
+      const snap = await locationsCol.where('owner', '==', userId).limit(1).get();
+      if (snap.empty) {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+
+      const ref = snap.docs[0].ref;
+      await ref.set({ isActive: req.body.isActive }, { merge: true });
+
+      const updated = await ref.get();
+      return res.json({ id: ref.id, ...updated.data() });
+    } catch (err) {
+      console.error('PUT /partner/visibility error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  }
+);
 
 /**
  * POST /api/partner/onboard
@@ -97,7 +139,11 @@ partnerRouter.post(
       }
       if (!email) return res.status(400).json({ error: 'Email required' });
 
-      const account = await stripeService.createPartnerAccount(userId, email, req.body);
+      const account = await stripeService.createPartnerAccount(
+        userId,
+        email,
+        req.body
+      );
 
       // persist on partners/{userId}
       await partnersCol.doc(userId).set(
@@ -146,6 +192,7 @@ hostRouter.put(
     }
   }
 );
+
 /**
  * PUT /api/host/auto-accept
  * Globally toggle autoAcceptGuests for this host's location.
