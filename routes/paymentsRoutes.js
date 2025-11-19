@@ -7,6 +7,8 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { firestore, admin } = require('../firebase-admin');
 
 const router = express.Router();
+const guestVisitsCol = firestore.collection('guestVisits');
+const locationsCol = firestore.collection('locations');
 
 /**
  * GET /api/payments/prices
@@ -33,7 +35,8 @@ router.post(
   [body('priceId', 'priceId is required').notEmpty()],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty())
+      return res.status(400).json({ errors: errors.array() });
 
     try {
       const { priceId } = req.body;
@@ -45,7 +48,9 @@ router.post(
       res.json({ sessionId: session.id, url: session.url });
     } catch (err) {
       console.error('subscription checkout error:', err);
-      res.status(500).json({ error: 'Failed to create subscription checkout session' });
+      res
+        .status(500)
+        .json({ error: 'Failed to create subscription checkout session' });
     }
   }
 );
@@ -61,7 +66,8 @@ router.post(
   [body('priceId', 'priceId is required').notEmpty()],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty())
+      return res.status(400).json({ errors: errors.array() });
 
     try {
       const { priceId } = req.body;
@@ -122,11 +128,10 @@ router.post(
           locationId,
           userId: req.user.id || req.user.userId || '',
         },
-        // 🔥 FIXED — hash route added
+        // HashRouter-aware success/cancel URLs
         success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.CLIENT_URL}/#/`,
       });
-      
 
       res.json({ sessionId: session.id, url: session.url });
     } catch (err) {
@@ -173,6 +178,8 @@ router.get('/config', (_req, res) => {
  * Used by MyPass page:
  *  - Verifies session with Stripe
  *  - Creates a guestVisits document if not already created for this session
+ *  - Applies auto-accept + duration
+ *  - Lazily expires visits if time is up
  *  - Returns session, location, and visit info
  */
 router.get('/guest/session/:sessionId', protect, async (req, res) => {
@@ -192,13 +199,15 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // Optional: make sure the session is for this user
+    // Ensure the session belongs to this user
     if (
       session.customer_email &&
       req.user.email &&
       session.customer_email.toLowerCase() !== req.user.email.toLowerCase()
     ) {
-      return res.status(403).json({ error: 'Session does not belong to this user' });
+      return res
+        .status(403)
+        .json({ error: 'Session does not belong to this user' });
     }
 
     const metadata = session.metadata || {};
@@ -206,11 +215,13 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
     const userId = metadata.userId || req.user.id || req.user.userId;
 
     if (!locationId) {
-      return res.status(400).json({ error: 'Session is missing locationId metadata' });
+      return res
+        .status(400)
+        .json({ error: 'Session is missing locationId metadata' });
     }
 
     // 2) Fetch location info
-    const locRef = firestore.collection('locations').doc(locationId);
+    const locRef = locationsCol.doc(locationId);
     const locSnap = await locRef.get();
 
     if (!locSnap.exists) {
@@ -218,27 +229,109 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
     }
 
     const location = { id: locSnap.id, ...locSnap.data() };
+    const autoAcceptGuests = !!location.autoAcceptGuests;
+    const partnerId = location.owner || null;
 
     // 3) Create or fetch guest visit in Firestore
-    const guestVisitsCol = firestore.collection('guestVisits');
-
-    // Try to find an existing visit for this Stripe session
     const existingVisitSnap = await guestVisitsCol
       .where('stripeSessionId', '==', session.id)
       .limit(1)
       .get();
 
-    let visitStatus = "pending";
-    if (session.payment_status === "paid") {
-      visitStatus = autoAcceptGuests ? "active" : "pending";
-    
+    const now = admin.firestore.Timestamp.now();
+    const dayNames = [
+      'Sunday',
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+    ];
+    const nowJs = new Date();
+    const todayName = dayNames[nowJs.getDay()];
+
+    let visitDoc;
+
+    // Helper to lazily expire a visit if it's past expiresAt
+    const maybeExpireVisit = async (docId, data) => {
+      if (
+        data.status === 'active' &&
+        data.expiresAt &&
+        typeof data.expiresAt.toDate === 'function'
+      ) {
+        const expDate = data.expiresAt.toDate();
+        if (new Date() > expDate) {
+          await guestVisitsCol.doc(docId).set(
+            {
+              status: 'expired',
+              endTime: admin.firestore.Timestamp.fromDate(expDate),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+          return {
+            ...data,
+            status: 'expired',
+            endTime: admin.firestore.Timestamp.fromDate(expDate),
+          };
+        }
+      }
+      return data;
+    };
+
+    if (!existingVisitSnap.empty) {
+      // Visit already exists for this Stripe session
+      const doc = existingVisitSnap.docs[0];
+      let data = doc.data() || {};
+      data = await maybeExpireVisit(doc.id, data);
+      visitDoc = { id: doc.id, ...data };
+    } else {
+      // No visit yet for this session
+      const isPaid =
+        session.payment_status === 'paid' ||
+        session.payment_status === 'no_payment_required';
+
+      if (!isPaid) {
+        // Not paid yet – no visit. Still return session + location.
+        return res.json({
+          session: {
+            id: session.id,
+            status: session.payment_status,
+            amountTotal: session.amount_total,
+            currency: session.currency,
+          },
+          location,
+          visit: null,
+        });
+      }
+
+      // Payment is complete – create a new visit
+// P2P VIP: short, high-rotation window under 10 minutes
+const maxDurationMinutes = 8; // tweak here if you ever want 7 / 9 / 10
+const expiresAt = admin.firestore.Timestamp.fromMillis(
+  now.toMillis() + maxDurationMinutes * 60 * 1000
+);
+
+      const visitStatus = autoAcceptGuests ? 'active' : 'pending';
+
       const visitData = {
         stripeSessionId: session.id,
         userId,
         locationId,
-        status: session.payment_status === 'paid' ? 'active' : 'pending', // basic state for now
+        partnerId,
+        status: visitStatus, // "active" or "pending"
         amountTotal: session.amount_total,
         currency: session.currency,
+
+        startTime: now,
+        endTime: null,
+        maxDurationMinutes,
+        expiresAt,
+
+        dayOfWeek: todayName,
+        passType: 'one-time',
+
         createdAt: now,
         updatedAt: now,
       };
@@ -246,9 +339,6 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       const newRef = await guestVisitsCol.add(visitData);
       const newSnap = await newRef.get();
       visitDoc = { id: newRef.id, ...newSnap.data() };
-    } else {
-      const doc = existingVisitSnap.docs[0];
-      visitDoc = { id: doc.id, ...doc.data() };
     }
 
     return res.json({
@@ -269,4 +359,58 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/payments/guest/visit/:visitId/end
+ *
+ * Guest manually ends an active visit (e.g. leaves early).
+ */
+router.post('/guest/visit/:visitId/end', protect, async (req, res) => {
+  const { visitId } = req.params;
+  const userId = req.user.id || req.user.userId;
+
+  try {
+    const visitRef = guestVisitsCol.doc(visitId);
+    const snap = await visitRef.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Visit not found' });
+    }
+
+    const visit = snap.data() || {};
+
+    if (visit.userId !== userId) {
+      return res
+        .status(403)
+        .json({ error: 'You are not allowed to end this visit' });
+    }
+
+    if (visit.status !== 'active') {
+      return res.status(400).json({ error: 'Visit is not active' });
+    }
+
+    const now = admin.firestore.Timestamp.now();
+
+    await visitRef.set(
+      {
+        status: 'completed',
+        endTime: now,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+
+    return res.json({
+      id: visitId,
+      status: 'completed',
+      endTime: now,
+    });
+  } catch (err) {
+    console.error('End visit error:', err);
+    return res
+      .status(500)
+      .json({ error: err.message || 'Failed to end visit' });
+  }
+});
+
 module.exports = router;
+
