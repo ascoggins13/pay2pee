@@ -10,6 +10,7 @@ const stripeService = require("../services/stripeService");
 const usersCol = firestore.collection("users");
 const partnersCol = firestore.collection("partners");
 const locationsCol = firestore.collection("locations");
+const guestVisitsCol = firestore.collection("guestVisits");
 const FieldValue = admin.firestore.FieldValue;
 
 // Helper: Geocode an address into { lat, lng }
@@ -57,7 +58,6 @@ const partnerRouter = express.Router();
 
 /**
  * GET /api/partner/summary
- * Returns dashboard data for the currently logged-in partner.
  */
 partnerRouter.get("/summary", protect, async (req, res) => {
   try {
@@ -129,8 +129,6 @@ partnerRouter.get("/summary", protect, async (req, res) => {
 
 /**
  * PUT /api/partner/location
- * Create or update the partner's primary bathroom listing.
- * Also geocodes the address into coordinates for the guest map.
  */
 partnerRouter.put(
   "/location",
@@ -162,8 +160,10 @@ partnerRouter.put(
         photos = [],
       } = req.body;
 
-      // Find existing location for this owner
-      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+      const snap = await locationsCol
+        .where("owner", "==", userId)
+        .limit(1)
+        .get();
 
       let locRef;
       let existing = {};
@@ -174,7 +174,6 @@ partnerRouter.put(
         existing = snap.docs[0].data() || {};
       }
 
-      // Decide if address changed (so we re-geocode)
       const addressChanged =
         typeof address === "string" &&
         address.trim() &&
@@ -234,7 +233,6 @@ partnerRouter.put(
 
 /**
  * PUT /api/partner/visibility
- * Toggle partner listing active/pause (used by the Status toggle on UI).
  */
 partnerRouter.put(
   "/visibility",
@@ -250,7 +248,10 @@ partnerRouter.put(
       const userId = req.user.userId;
       const { isActive } = req.body;
 
-      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+      const snap = await locationsCol
+        .where("owner", "==", userId)
+        .limit(1)
+        .get();
       if (snap.empty) {
         return res.status(404).json({ error: "Location not found" });
       }
@@ -273,8 +274,199 @@ partnerRouter.put(
 );
 
 /**
+ * GET /api/partner/analytics
+ * Returns real analytics for the partner dashboard.
+ */
+partnerRouter.get("/analytics", protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Find this partner's primary location
+    const locSnap = await locationsCol
+      .where("owner", "==", userId)
+      .limit(1)
+      .get();
+
+    if (locSnap.empty) {
+      return res.json({
+        stats: { activeGuests: 0, totalGuestsToday: 0 },
+        requestedGuests: [],
+        activeGuests: [],
+        weeklyTraffic: {
+          Monday: 0,
+          Tuesday: 0,
+          Wednesday: 0,
+          Thursday: 0,
+          Friday: 0,
+          Saturday: 0,
+          Sunday: 0,
+        },
+        autoAcceptGuests: false,
+        autoAcceptEnabled: false,
+      });
+    }
+
+    const locDoc = locSnap.docs[0];
+    const locId = locDoc.id;
+    const locData = locDoc.data() || {};
+    const autoAcceptGuests = !!locData.autoAcceptGuests;
+
+    // All visits for this location
+    const visitsSnap = await guestVisitsCol
+      .where("locationId", "==", locId)
+      .get();
+
+    const visits = visitsSnap.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    const dayNames = [
+      "Sunday",
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+    ];
+    const now = new Date();
+    const todayName = dayNames[now.getDay()];
+
+    // Build requested vs active
+    const requestedGuests = [];
+    const activeGuests = [];
+
+    // Weekly traffic counts
+    const weeklyTraffic = {
+      Monday: 0,
+      Tuesday: 0,
+      Wednesday: 0,
+      Thursday: 0,
+      Friday: 0,
+      Saturday: 0,
+      Sunday: 0,
+    };
+
+    visits.forEach((v) => {
+      const status = (v.status || "").toLowerCase();
+
+      if (status === "requested" || status === "pending") {
+        requestedGuests.push(v);
+      } else if (status === "active") {
+        activeGuests.push(v);
+      }
+
+      // Determine day-of-week for this visit
+      let visitDay = v.dayOfWeek;
+      if (!visitDay) {
+        const ts = v.createdAt || v.startTime;
+        if (ts && typeof ts.toDate === "function") {
+          const d = ts.toDate();
+          visitDay = dayNames[d.getDay()];
+        }
+      }
+
+      if (visitDay && weeklyTraffic[visitDay] !== undefined) {
+        weeklyTraffic[visitDay] += 1;
+      }
+    });
+
+    // Today's total
+    const totalGuestsToday = visits.filter((v) => {
+      let visitDay = v.dayOfWeek;
+      if (!visitDay) {
+        const ts = v.createdAt || v.startTime;
+        if (ts && typeof ts.toDate === "function") {
+          const d = ts.toDate();
+          visitDay = dayNames[d.getDay()];
+        }
+      }
+      return visitDay === todayName;
+    }).length;
+
+    const stats = {
+      activeGuests: activeGuests.length,
+      totalGuestsToday,
+    };
+
+    return res.json({
+      stats,
+      requestedGuests,
+      activeGuests,
+      weeklyTraffic,
+      autoAcceptGuests,
+      autoAcceptEnabled: autoAcceptGuests,
+    });
+  } catch (err) {
+    console.error("GET /partner/analytics error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * POST /api/partner/guests/:visitId/accept
+ * Manually accept a requested guest (status -> active).
+ */
+partnerRouter.post(
+  "/guests/:visitId/accept",
+  protect,
+  async (req, res) => {
+    try {
+      const userId = req.user.userId;
+      const { visitId } = req.params;
+
+      const visitRef = guestVisitsCol.doc(visitId);
+      const visitSnap = await visitRef.get();
+
+      if (!visitSnap.exists) {
+        return res.status(404).json({ error: "Visit not found" });
+      }
+
+      const visit = visitSnap.data() || {};
+      const locationId = visit.locationId;
+
+      if (!locationId) {
+        return res
+          .status(400)
+          .json({ error: "Visit is missing a locationId" });
+      }
+
+      const locRef = locationsCol.doc(locationId);
+      const locSnap = await locRef.get();
+
+      if (!locSnap.exists) {
+        return res.status(404).json({ error: "Location not found" });
+      }
+
+      const locData = locSnap.data() || {};
+      if (locData.owner !== userId) {
+        return res.status(403).json({
+          error: "You are not allowed to manage visits for this location",
+        });
+      }
+
+      await visitRef.set(
+        {
+          status: "active",
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return res.json({
+        id: visitId,
+        status: "active",
+      });
+    } catch (err) {
+      console.error("POST /partner/guests/:visitId/accept error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+/**
  * POST /api/partner/onboard
- * Optional: create/link a Stripe account using stripeService.
  */
 partnerRouter.post(
   "/onboard",
@@ -332,7 +524,6 @@ const hostRouter = express.Router();
 
 /**
  * PUT /api/host/visibility
- * Legacy alias: same logic as /api/partner/visibility
  */
 hostRouter.put(
   "/visibility",
@@ -347,7 +538,10 @@ hostRouter.put(
       const userId = req.user.userId;
       const { isActive } = req.body;
 
-      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+      const snap = await locationsCol
+        .where("owner", "==", userId)
+        .limit(1)
+        .get();
       if (snap.empty) return res.status(404).json({ error: "Location not found" });
 
       const ref = snap.docs[0].ref;
@@ -384,7 +578,10 @@ hostRouter.put(
       const userId = req.user.userId;
       const { autoAcceptGuests } = req.body;
 
-      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+      const snap = await locationsCol
+        .where("owner", "==", userId)
+        .limit(1)
+        .get();
       if (snap.empty) return res.status(404).json({ error: "Location not found" });
 
       const ref = snap.docs[0].ref;
@@ -405,7 +602,6 @@ hostRouter.put(
 
 /**
  * POST /api/host/payout
- * Trigger a manual payout of the partner's pending balance.
  */
 hostRouter.post(
   "/payout",

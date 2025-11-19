@@ -228,10 +228,10 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       .limit(1)
       .get();
 
-    let visitDoc;
-    if (existingVisitSnap.empty) {
-      const now = admin.firestore.FieldValue.serverTimestamp();
-
+    let visitStatus = "pending";
+    if (session.payment_status === "paid") {
+      visitStatus = autoAcceptGuests ? "active" : "pending";
+    
       const visitData = {
         stripeSessionId: session.id,
         userId,
