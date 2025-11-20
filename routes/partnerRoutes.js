@@ -56,7 +56,8 @@ const partnerRouter = express.Router();
 /**
  * GET /api/partner/summary
  * Used by PartnerHomeScreen to load profile + location summary info.
- * Now also refreshes Stripe account status from Stripe when possible.
+ * - Refreshes Stripe status from Stripe when possible
+ * - Computes today's guests from guestVisits
  */
 partnerRouter.get('/summary', protect, async (req, res) => {
   try {
@@ -72,7 +73,9 @@ partnerRouter.get('/summary', protect, async (req, res) => {
     const partner = partnerDoc.exists ? partnerDoc.data() : {};
 
     const hasLocation = !locSnap.empty;
-    const loc = hasLocation ? locSnap.docs[0].data() : {};
+    const locDoc = hasLocation ? locSnap.docs[0] : null;
+    const loc = hasLocation ? locDoc.data() : {};
+    const locId = hasLocation ? locDoc.id : null;
 
     // 🔹 Refresh Stripe status live if we have a Stripe account ID
     let stripeStatus = partner.stripeStatus || {};
@@ -103,6 +106,44 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
+    // 🔹 Compute today's guests from guestVisits (for PartnerHomeScreen)
+    let todayCount = 0;
+    if (locId) {
+      try {
+        const visitsSnap = await guestVisitsCol
+          .where('locationId', '==', locId)
+          .get();
+
+        const dayNames = [
+          'Sunday',
+          'Monday',
+          'Tuesday',
+          'Wednesday',
+          'Thursday',
+          'Friday',
+          'Saturday',
+        ];
+        const now = new Date();
+        const todayName = dayNames[now.getDay()];
+
+        const visits = visitsSnap.docs.map((d) => d.data());
+
+        todayCount = visits.filter((v) => {
+          let visitDay = v.dayOfWeek;
+          if (!visitDay) {
+            const ts = v.createdAt || v.startTime;
+            if (ts && typeof ts.toDate === 'function') {
+              visitDay = dayNames[ts.toDate().getDay()];
+            }
+          }
+          return visitDay === todayName;
+        }).length;
+      } catch (err) {
+        console.error('Error computing todayVisits in /partner/summary:', err);
+        todayCount = 0;
+      }
+    }
+
     const data = {
       partnerId: userId,
       email: user.email || partner.email || null,
@@ -114,7 +155,8 @@ partnerRouter.get('/summary', protect, async (req, res) => {
         'Add your address so guests can find you.',
       isActive: loc.isActive !== false,
 
-      todayVisits: Number(loc.todayVisits || 0),
+      // 🔹 Use computed value instead of loc.todayVisits
+      todayVisits: todayCount,
       currentBalance: Number(partner.pendingPayout || 0),
       lastPayoutDate: partner.lastPayoutDate || null,
       rating: loc.rating || 4.8,
@@ -742,4 +784,3 @@ hostRouter.post(
 );
 
 module.exports = { partnerRouter, hostRouter };
-
