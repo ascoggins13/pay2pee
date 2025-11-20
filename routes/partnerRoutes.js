@@ -563,7 +563,7 @@ partnerRouter.post('/onboard-link', protect, async (req, res) => {
     }
 
     // 2) Create a hosted onboarding link
-    const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://pay2pee.app';
 
     const link = await stripeService.createAccountOnboardingLink(
       stripeAccountId,
