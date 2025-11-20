@@ -18,29 +18,65 @@ function getPriceIdForPlan(planId) {
   return price;
 }
 
+/**
+ * Create a hosted onboarding link for Stripe Connect
+ */
+async function createAccountOnboardingLink(accountId, returnUrl, refreshUrl) {
+  return stripe.accountLinks.create({
+    account: accountId,
+    refresh_url: refreshUrl,
+    return_url: returnUrl,
+    type: 'account_onboarding',
+  });
+}
+
+/**
+ * Ensure Stripe customer for guest subscriptions
+ */
 async function ensureStripeCustomer(userId, email) {
   const ref = usersCol.doc(userId);
   const snap = await ref.get();
   if (!snap.exists) throw new Error('User not found');
 
   const user = snap.data();
+
   if (user.stripeCustomerId) {
-    try { await stripe.customers.retrieve(user.stripeCustomerId); return user.stripeCustomerId; }
-    catch { /* fallthrough to recreate */ }
+    try {
+      await stripe.customers.retrieve(user.stripeCustomerId);
+      return user.stripeCustomerId;
+    } catch {
+      // Recreate if Stripe doesn't recognize it
+    }
   }
-  const customer = await stripe.customers.create({ email, metadata: { userId } });
+
+  const customer = await stripe.customers.create({
+    email,
+    metadata: { userId },
+  });
+
   await ref.set({ stripeCustomerId: customer.id }, { merge: true });
+
   return customer.id;
 }
 
-exports.createSubscription = async ({ userId, email, planId, paymentMethodId }) => {
+exports.createSubscription = async ({
+  userId,
+  email,
+  planId,
+  paymentMethodId,
+}) => {
   const customerId = await ensureStripeCustomer(userId, email);
-  await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId });
+
+  await stripe.paymentMethods.attach(paymentMethodId, {
+    customer: customerId,
+  });
+
   await stripe.customers.update(customerId, {
     invoice_settings: { default_payment_method: paymentMethodId },
   });
 
   const priceId = getPriceIdForPlan(planId);
+
   const subscription = await stripe.subscriptions.create({
     customer: customerId,
     items: [{ price: priceId }],
@@ -48,19 +84,25 @@ exports.createSubscription = async ({ userId, email, planId, paymentMethodId }) 
     expand: ['latest_invoice.payment_intent'],
   });
 
-  await usersCol.doc(userId).set({
-    subscription: {
-      id: subscription.id,
-      status: subscription.status || 'incomplete',
-      planId,
-      priceId,
-      currentPeriodEnd: subscription.current_period_end || null,
+  await usersCol.doc(userId).set(
+    {
+      subscription: {
+        id: subscription.id,
+        status: subscription.status || 'incomplete',
+        planId,
+        priceId,
+        currentPeriodEnd: subscription.current_period_end || null,
+      },
     },
-  }, { merge: true });
+    { merge: true }
+  );
 
   return { customerId, subscription };
 };
 
+/**
+ * Create partner Stripe Connect account
+ */
 exports.createPartnerAccount = async (partnerId, email, details = {}) => {
   const account = await stripe.accounts.create({
     type: 'custom',
@@ -70,17 +112,27 @@ exports.createPartnerAccount = async (partnerId, email, details = {}) => {
     individual: {
       first_name: details.firstName,
       last_name: details.lastName,
-      id_number: details.ssnLast4, // if provided
-      dob: details.dobDay ? { day: details.dobDay, month: details.dobMonth, year: details.dobYear } : undefined,
+      id_number: details.ssnLast4,
+      dob:
+        details.dobDay && details.dobMonth && details.dobYear
+          ? {
+              day: details.dobDay,
+              month: details.dobMonth,
+              year: details.dobYear,
+            }
+          : undefined,
     },
     capabilities: { transfers: { requested: true } },
     metadata: { partner_id: partnerId },
   });
 
-  await partnersCol.doc(partnerId).set({
-    stripeAccountId: account.id,
-    onboardingStatus: 'pending_verification',
-  }, { merge: true });
+  await partnersCol.doc(partnerId).set(
+    {
+      stripeAccountId: account.id,
+      onboardingStatus: 'pending_verification',
+    },
+    { merge: true }
+  );
 
   return account;
 };
@@ -88,17 +140,25 @@ exports.createPartnerAccount = async (partnerId, email, details = {}) => {
 exports.getStripeDashboardLink = async (partnerId) => {
   const doc = await partnersCol.doc(partnerId).get();
   const stripeAccountId = doc.exists ? doc.data().stripeAccountId : null;
-  if (!stripeAccountId) throw new Error('Partner has no Stripe account linked');
+
+  if (!stripeAccountId)
+    throw new Error('Partner has no Stripe account linked');
+
   const { url } = await stripe.accounts.createLoginLink(stripeAccountId);
   return url;
 };
 
+/**
+ * Initiate a manual payout to partner
+ */
 exports.initiateManualPayout = async (partnerId, amount) => {
   if (amount < 5) throw new Error('Minimum payout amount is $5.00');
 
   const doc = await partnersCol.doc(partnerId).get();
   const { stripeAccountId } = doc.data() || {};
-  if (!stripeAccountId) throw new Error('Partner has no Stripe account linked');
+
+  if (!stripeAccountId)
+    throw new Error('Partner has no Stripe account linked');
 
   const transfer = await stripe.transfers.create({
     amount: Math.round(amount * 100),
@@ -108,11 +168,13 @@ exports.initiateManualPayout = async (partnerId, amount) => {
   });
 
   const batch = firestore.batch();
+
   batch.update(partnersCol.doc(partnerId), {
     pendingPayout: admin.firestore.FieldValue.increment(-amount),
     totalPayouts: admin.firestore.FieldValue.increment(amount),
     lastPayoutDate: admin.firestore.FieldValue.serverTimestamp(),
   });
+
   batch.set(payoutsCol.doc(), {
     partnerId,
     amount,
@@ -120,20 +182,41 @@ exports.initiateManualPayout = async (partnerId, amount) => {
     status: 'pending',
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+
   await batch.commit();
 
   return transfer;
 };
 
+/**
+ * Record a completed booking
+ */
 exports.recordBooking = async (partnerId, amount) => {
   const platformFee = amount * 0.3;
   const partnerEarnings = amount * 0.7;
 
-  await partnersCol.doc(partnerId).set({
-    earnings: admin.firestore.FieldValue.increment(amount),
-    pendingPayout: admin.firestore.FieldValue.increment(partnerEarnings),
-    bookingsCount: admin.firestore.FieldValue.increment(1),
-    platformFees: admin.firestore.FieldValue.increment(platformFee),
-    lastBookingDate: admin.firestore.FieldValue.serverTimestamp(),
-  }, { merge: true });
+  await partnersCol.doc(partnerId).set(
+    {
+      earnings: admin.firestore.FieldValue.increment(amount),
+      pendingPayout: admin.firestore.FieldValue.increment(
+        partnerEarnings
+      ),
+      bookingsCount: admin.firestore.FieldValue.increment(1),
+      platformFees: admin.firestore.FieldValue.increment(platformFee),
+      lastBookingDate: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+};
+
+/**
+ * EXPORTS
+ */
+module.exports = {
+  createSubscription: exports.createSubscription,
+  createPartnerAccount: exports.createPartnerAccount,
+  getStripeDashboardLink: exports.getStripeDashboardLink,
+  initiateManualPayout: exports.initiateManualPayout,
+  recordBooking: exports.recordBooking,
+  createAccountOnboardingLink, // <-- IMPORTANT FIX
 };

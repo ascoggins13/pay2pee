@@ -518,6 +518,69 @@ partnerRouter.post(
   }
 );
 
+/**
+ * POST /api/partner/onboard-link
+ * Ensures a Stripe Connect account exists, then returns a hosted
+ * onboarding link URL so the partner can finish setup in Stripe.
+ */
+partnerRouter.post('/onboard-link', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+
+    // get email from body or users collection
+    let email = req.body.email;
+    if (!email) {
+      const userDoc = await usersCol.doc(userId).get();
+      email = userDoc.exists ? userDoc.data().email : null;
+    }
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
+    }
+
+    // load partner doc
+    const partnerRef = partnersCol.doc(userId);
+    const partnerSnap = await partnerRef.get();
+    const partnerData = partnerSnap.exists ? partnerSnap.data() : {};
+    let { stripeAccountId } = partnerData;
+
+    // 1) If no Stripe account yet, create one
+    if (!stripeAccountId) {
+      const account = await stripeService.createPartnerAccount(
+        userId,
+        email,
+        req.body || {}
+      );
+      stripeAccountId = account.id;
+
+      await partnerRef.set(
+        {
+          stripeAccountId,
+          onboardingStatus: 'pending_verification',
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+
+    // 2) Create a hosted onboarding link
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    const link = await stripeService.createAccountOnboardingLink(
+      stripeAccountId,
+      `${FRONTEND_URL}/partner`,
+      `${FRONTEND_URL}/partner`
+    );
+
+    return res.json({ url: link.url });
+  } catch (err) {
+    console.error('POST /partner/onboard-link error:', err);
+    return res
+      .status(500)
+      .json({ error: err.message || 'Stripe onboarding link error' });
+  }
+});
+
+
 // ─────────────────────────────────────────────────────────────
 // Host router -> /api/host/*
 // ─────────────────────────────────────────────────────────────
