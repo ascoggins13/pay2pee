@@ -56,6 +56,7 @@ const partnerRouter = express.Router();
 /**
  * GET /api/partner/summary
  * Used by PartnerHomeScreen to load profile + location summary info.
+ * Now also refreshes Stripe account status from Stripe when possible.
  */
 partnerRouter.get('/summary', protect, async (req, res) => {
   try {
@@ -71,10 +72,36 @@ partnerRouter.get('/summary', protect, async (req, res) => {
     const partner = partnerDoc.exists ? partnerDoc.data() : {};
 
     const hasLocation = !locSnap.empty;
-    const locRef = hasLocation ? locSnap.docs[0].ref : null;
     const loc = hasLocation ? locSnap.docs[0].data() : {};
 
-    const stripeStatus = partner.stripeStatus || {};
+    // 🔹 Refresh Stripe status live if we have a Stripe account ID
+    let stripeStatus = partner.stripeStatus || {};
+    if (partner.stripeAccountId && typeof stripeService.getAccount === 'function') {
+      try {
+        const acct = await stripeService.getAccount(partner.stripeAccountId);
+        stripeStatus = {
+          charges_enabled: !!acct.charges_enabled,
+          payouts_enabled: !!acct.payouts_enabled,
+          details_submitted: !!acct.details_submitted,
+        };
+
+        // Persist latest status in Firestore
+        await partnersCol.doc(userId).set(
+          {
+            stripeStatus,
+            onboardingStatus: acct.details_submitted
+              ? 'verified'
+              : 'pending_verification',
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      } catch (err) {
+        console.error('Error refreshing Stripe account status:', err);
+        // fall back to whatever was stored
+        stripeStatus = partner.stripeStatus || {};
+      }
+    }
 
     const data = {
       partnerId: userId,
@@ -715,3 +742,4 @@ hostRouter.post(
 );
 
 module.exports = { partnerRouter, hostRouter };
+

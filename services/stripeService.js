@@ -28,8 +28,10 @@ async function createAccountOnboardingLink(accountId, returnUrl, refreshUrl) {
     return_url: returnUrl,
     type: 'account_onboarding',
   });
+}// Get the latest Stripe account object for a Connect account
+async function getAccount(accountId) {
+  return stripe.accounts.retrieve(accountId);
 }
-
 /**
  * Ensure Stripe customer for guest subscriptions
  */
@@ -219,4 +221,5 @@ module.exports = {
   initiateManualPayout: exports.initiateManualPayout,
   recordBooking: exports.recordBooking,
   createAccountOnboardingLink, // <-- IMPORTANT FIX
+  getAccount,   // <-- NEW
 };
