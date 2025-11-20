@@ -562,23 +562,24 @@ partnerRouter.post('/onboard-link', protect, async (req, res) => {
       );
     }
 
-    // 2) Create a hosted onboarding link
-    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://pay2pee.app';
+    // Use the main app URL and hash route for Partner home
+const FRONTEND_URL =
+process.env.FRONTEND_URL || 'https://pay2pee.app';
 
-    const link = await stripeService.createAccountOnboardingLink(
-      stripeAccountId,
-      `${FRONTEND_URL}/partner`,
-      `${FRONTEND_URL}/partner`
-    );
+// For a HashRouter app, this is the safest:
+const returnUrl = `${FRONTEND_URL}/#/partner`;
+const refreshUrl = `${FRONTEND_URL}/#/partner`;
 
-    return res.json({ url: link.url });
-  } catch (err) {
-    console.error('POST /partner/onboard-link error:', err);
-    return res
-      .status(500)
-      .json({ error: err.message || 'Stripe onboarding link error' });
-  }
-});
+console.log('Stripe returnUrl:', returnUrl);
+
+const link = await stripeService.createAccountOnboardingLink(
+stripeAccountId,
+returnUrl,  // return_url
+refreshUrl  // refresh_url
+);
+
+return res.json({ url: link.url, frontendUrl: FRONTEND_URL });
+
 
 
 // ─────────────────────────────────────────────────────────────
