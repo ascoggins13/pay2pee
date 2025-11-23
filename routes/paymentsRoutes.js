@@ -79,7 +79,9 @@ router.post(
       res.json({ sessionId: session.id, url: session.url });
     } catch (err) {
       console.error('one-time checkout error:', err);
-      res.status(500).json({ error: 'Failed to create one-time checkout session' });
+      res
+        .status(500)
+        .json({ error: 'Failed to create one-time checkout session' });
     }
   }
 );
@@ -88,6 +90,7 @@ router.post(
  * POST /api/payments/guest/checkout
  * Body: { locationId, price, name? }
  * Creates a Stripe Checkout Session for a single restroom visit
+ * UPDATED: routes payment to partner's connected Stripe account with 30% platform fee
  */
 router.post(
   '/guest/checkout',
@@ -107,6 +110,45 @@ router.post(
       const { locationId, price, name } = req.body;
       const amountInCents = Math.round(Number(price) * 100);
 
+      // 1) Fetch location to get partnerId
+      const locSnap = await locationsCol.doc(locationId).get();
+      if (!locSnap.exists) {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      const location = locSnap.data();
+      const partnerId = location.owner;
+
+      if (!partnerId) {
+        return res
+          .status(400)
+          .json({ error: 'Location missing partner owner' });
+      }
+
+      // 2) Fetch partner to get stripeAccountId (connected account)
+      const partnerSnap = await firestore
+        .collection('partners')
+        .doc(partnerId)
+        .get();
+      if (!partnerSnap.exists) {
+        return res.status(404).json({ error: 'Partner not found' });
+      }
+
+      const partnerData = partnerSnap.data();
+      const stripeAccountId = partnerData.stripeAccountId;
+
+      if (!stripeAccountId) {
+        return res.status(400).json({
+          error: 'Partner does not have a connected Stripe account yet',
+        });
+      }
+
+      // 3) Apply your 30% platform fee
+      const platformFeePercent = 0.30;
+      const applicationFeeAmount = Math.round(
+        amountInCents * platformFeePercent
+      );
+
+      // 4) Create destination-charge Checkout Session
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
         payment_method_types: ['card'],
@@ -126,7 +168,14 @@ router.post(
         metadata: {
           type: 'guest_pass',
           locationId,
+          partnerId,
           userId: req.user.id || req.user.userId || '',
+        },
+        payment_intent_data: {
+          application_fee_amount: applicationFeeAmount, // your 30% cut
+          transfer_data: {
+            destination: stripeAccountId, // partner receives the rest
+          },
         },
         // HashRouter-aware success/cancel URLs
         success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
@@ -307,11 +356,11 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       }
 
       // Payment is complete – create a new visit
-// P2P VIP: short, high-rotation window under 10 minutes
-const maxDurationMinutes = 8; // tweak here if you ever want 7 / 9 / 10
-const expiresAt = admin.firestore.Timestamp.fromMillis(
-  now.toMillis() + maxDurationMinutes * 60 * 1000
-);
+      // P2P VIP: short, high-rotation window under 10 minutes
+      const maxDurationMinutes = 8; // tweak here if you ever want 7 / 9 / 10
+      const expiresAt = admin.firestore.Timestamp.fromMillis(
+        now.toMillis() + maxDurationMinutes * 60 * 1000
+      );
 
       const visitStatus = autoAcceptGuests ? 'active' : 'pending';
 
