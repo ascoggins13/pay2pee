@@ -6,6 +6,8 @@ const axios = require('axios');
 const protect = require('../middleware/protect');
 const { admin, firestore } = require('../firebase-admin');
 const stripeService = require('../services/stripeService');
+// 🔹 NEW: Stripe client so we can read connected account balances
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const usersCol = firestore.collection('users');
 const partnersCol = firestore.collection('partners');
@@ -58,6 +60,7 @@ const partnerRouter = express.Router();
  * Used by PartnerHomeScreen to load profile + location summary info.
  * - Refreshes Stripe status from Stripe when possible
  * - Computes today's guests from guestVisits
+ * - NOW returns Stripe connected balance as currentBalance
  */
 partnerRouter.get('/summary', protect, async (req, res) => {
   try {
@@ -79,7 +82,10 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
     // 🔹 Refresh Stripe status live if we have a Stripe account ID
     let stripeStatus = partner.stripeStatus || {};
-    if (partner.stripeAccountId && typeof stripeService.getAccount === 'function') {
+    if (
+      partner.stripeAccountId &&
+      typeof stripeService.getAccount === 'function'
+    ) {
       try {
         const acct = await stripeService.getAccount(partner.stripeAccountId);
         stripeStatus = {
@@ -144,6 +150,33 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
+    // 🔹 NEW: get real Stripe connected account balance (USD)
+    let stripeBalance = null;
+    if (partner.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
+      try {
+        const bal = await stripe.balance.retrieve({
+          stripeAccount: partner.stripeAccountId,
+        });
+
+        const available = Array.isArray(bal.available) ? bal.available : [];
+        const usdAvail =
+          available.find((b) => b.currency === 'usd') || available[0];
+
+        const amountCents = usdAvail ? usdAvail.amount : 0;
+        stripeBalance = amountCents / 100;
+      } catch (err) {
+        console.error(
+          'Error retrieving Stripe balance for partner in /summary:',
+          err
+        );
+      }
+    }
+
+    const computedCurrentBalance =
+      stripeBalance != null
+        ? Number(stripeBalance.toFixed(2))
+        : Number(partner.pendingPayout || 0);
+
     const data = {
       partnerId: userId,
       email: user.email || partner.email || null,
@@ -157,7 +190,13 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
       // 🔹 Use computed value instead of loc.todayVisits
       todayVisits: todayCount,
-      currentBalance: Number(partner.pendingPayout || 0),
+
+      // 🔹 NOW driven by Stripe balance when available
+      currentBalance: computedCurrentBalance,
+      // Optional extra field if frontend wants to read Stripe explicitly
+      stripeBalance:
+        stripeBalance != null ? Number(stripeBalance.toFixed(2)) : null,
+
       lastPayoutDate: partner.lastPayoutDate || null,
       rating: loc.rating || 4.8,
 
@@ -748,6 +787,8 @@ hostRouter.put(
 /**
  * POST /api/host/payout
  * Manual payout request for partner.
+ * NOTE: This currently uses your existing stripeService.initiateManualPayout
+ * and then returns the fresh Stripe connected balance as newBalance.
  */
 hostRouter.post(
   '/payout',
@@ -770,11 +811,38 @@ hostRouter.post(
       const doc = await partnersCol.doc(partnerId).get();
       const pdata = doc.exists ? doc.data() : {};
 
+      // 🔹 NEW: read Stripe connected balance again so UI sees updated number
+      let stripeBalance = null;
+      if (pdata.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
+        try {
+          const bal = await stripe.balance.retrieve({
+            stripeAccount: pdata.stripeAccountId,
+          });
+          const available = Array.isArray(bal.available)
+            ? bal.available
+            : [];
+          const usdAvail =
+            available.find((b) => b.currency === 'usd') ||
+            available[0];
+          const amountCents = usdAvail ? usdAvail.amount : 0;
+          stripeBalance = amountCents / 100;
+        } catch (err) {
+          console.error(
+            'Error retrieving Stripe balance after payout:',
+            err
+          );
+        }
+      }
+
       return res.json({
         success: true,
         transferId: transfer.id,
-        newBalance: Number(pdata.pendingPayout || 0),
-        lastPayoutDate: pdata.lastPayoutDate || new Date().toISOString(),
+        newBalance:
+          stripeBalance != null
+            ? Number(stripeBalance.toFixed(2))
+            : Number(pdata.pendingPayout || 0),
+        lastPayoutDate:
+          pdata.lastPayoutDate || new Date().toISOString(),
       });
     } catch (err) {
       console.error('POST /host/payout error:', err);
