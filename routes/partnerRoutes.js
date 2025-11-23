@@ -6,7 +6,7 @@ const axios = require('axios');
 const protect = require('../middleware/protect');
 const { admin, firestore } = require('../firebase-admin');
 const stripeService = require('../services/stripeService');
-// 🔹 NEW: Stripe client so we can read connected account balances
+// Stripe client so we can read connected account balances
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const usersCol = firestore.collection('users');
@@ -67,7 +67,8 @@ const partnerRouter = express.Router();
  * Used by PartnerHomeScreen to load profile + location summary info.
  * - Refreshes Stripe status from Stripe when possible
  * - Computes today's guests from guestVisits
- * - NOW returns Stripe connected total balance (available + pending) as currentBalance
+ * - Returns Stripe connected total balance (available + pending) as currentBalance
+ * - Also returns stripeAvailableBalance / stripePendingBalance
  */
 partnerRouter.get('/summary', protect, async (req, res) => {
   try {
@@ -87,7 +88,7 @@ partnerRouter.get('/summary', protect, async (req, res) => {
     const loc = hasLocation ? locDoc.data() : {};
     const locId = hasLocation ? locDoc.id : null;
 
-    // 🔹 Refresh Stripe status live if we have a Stripe account ID
+    // Refresh Stripe status live if we have a Stripe account ID
     let stripeStatus = partner.stripeStatus || {};
     if (partner.stripeAccountId && typeof stripeService.getAccount === 'function') {
       try {
@@ -116,7 +117,7 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
-    // 🔹 Compute today's guests from guestVisits (for PartnerHomeScreen)
+    // Compute today's guests from guestVisits (for PartnerHomeScreen)
     let todayCount = 0;
     if (locId) {
       try {
@@ -154,8 +155,11 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
-    // 🔹 NEW: get real Stripe connected total balance (available + pending)
+    // Get real Stripe connected total balance (available + pending)
     let stripeBalance = null;
+    let stripeAvailable = null;
+    let stripePending = null;
+
     if (partner.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
       try {
         const bal = await stripe.balance.retrieve({
@@ -164,14 +168,12 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
         const availableCents = getUsdAmountCents(bal.available);
         const pendingCents = getUsdAmountCents(bal.pending);
-        const totalCents = availableCents + pendingCents;
 
-        stripeBalance = totalCents / 100;
+        stripeAvailable = availableCents / 100;
+        stripePending = pendingCents / 100;
+        stripeBalance = (availableCents + pendingCents) / 100;
       } catch (err) {
-        console.error(
-          'Error retrieving Stripe balance for partner in /summary:',
-          err
-        );
+        console.error('Error retrieving Stripe balance for partner in /summary:', err);
       }
     }
 
@@ -191,14 +193,18 @@ partnerRouter.get('/summary', protect, async (req, res) => {
         'Add your address so guests can find you.',
       isActive: loc.isActive !== false,
 
-      // 🔹 Use computed value instead of loc.todayVisits
       todayVisits: todayCount,
 
-      // 🔹 NOW driven by Stripe total balance when available
+      // main number you’re showing right now (total)
       currentBalance: computedCurrentBalance,
-      // Optional extra field if frontend wants to read Stripe explicitly
+
+      // expose Stripe balances separately
       stripeBalance:
         stripeBalance != null ? Number(stripeBalance.toFixed(2)) : null,
+      stripeAvailableBalance:
+        stripeAvailable != null ? Number(stripeAvailable.toFixed(2)) : null,
+      stripePendingBalance:
+        stripePending != null ? Number(stripePending.toFixed(2)) : null,
 
       lastPayoutDate: partner.lastPayoutDate || null,
       rating: loc.rating || 4.8,
@@ -814,7 +820,7 @@ hostRouter.post(
       const doc = await partnersCol.doc(partnerId).get();
       const pdata = doc.exists ? doc.data() : {};
 
-      // 🔹 NEW: read Stripe connected total balance again so UI sees updated number
+      // Read Stripe connected total balance again so UI sees updated number
       let stripeBalance = null;
       if (pdata.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
         try {
@@ -826,10 +832,7 @@ hostRouter.post(
           const totalCents = availableCents + pendingCents;
           stripeBalance = totalCents / 100;
         } catch (err) {
-          console.error(
-            'Error retrieving Stripe balance after payout:',
-            err
-          );
+          console.error('Error retrieving Stripe balance after payout:', err);
         }
       }
 
