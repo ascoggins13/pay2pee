@@ -6,8 +6,6 @@ const axios = require('axios');
 const protect = require('../middleware/protect');
 const { admin, firestore } = require('../firebase-admin');
 const stripeService = require('../services/stripeService');
-// 🔹 NEW: direct Stripe import so we can read connected account balances
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const usersCol = firestore.collection('users');
 const partnersCol = firestore.collection('partners');
@@ -108,25 +106,6 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
-    // 🔹 NEW: read Stripe balance for this partner's connected account
-    let stripeBalance = null;
-    if (partner.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
-      try {
-        const bal = await stripe.balance.retrieve({
-          stripeAccount: partner.stripeAccountId,
-        });
-
-        const available = Array.isArray(bal.available) ? bal.available : [];
-        const usdAvail =
-          available.find((b) => b.currency === 'usd') || available[0];
-
-        const amountCents = usdAvail ? usdAvail.amount : 0;
-        stripeBalance = amountCents / 100; // convert to dollars
-      } catch (err) {
-        console.error('Error retrieving Stripe balance for partner:', err);
-      }
-    }
-
     // 🔹 Compute today's guests from guestVisits (for PartnerHomeScreen)
     let todayCount = 0;
     if (locId) {
@@ -165,11 +144,6 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
-    const computedCurrentBalance =
-      stripeBalance != null
-        ? Number(stripeBalance.toFixed(2))
-        : Number(partner.pendingPayout || 0);
-
     const data = {
       partnerId: userId,
       email: user.email || partner.email || null,
@@ -183,13 +157,7 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
       // 🔹 Use computed value instead of loc.todayVisits
       todayVisits: todayCount,
-
-      // 🔹 NOW driven by Stripe balance when available
-      currentBalance: computedCurrentBalance,
-      // Optional extra field if you want to inspect it directly
-      stripeBalance:
-        stripeBalance != null ? Number(stripeBalance.toFixed(2)) : null,
-
+      currentBalance: Number(partner.pendingPayout || 0),
       lastPayoutDate: partner.lastPayoutDate || null,
       rating: loc.rating || 4.8,
 
@@ -331,6 +299,364 @@ partnerRouter.put(
   }
 );
 
+/**
+ * GET /api/partner/analytics
+ * Returns analytics for the partner dashboard.
+ */
+partnerRouter.get('/analytics', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Find this partner's primary location
+    const locSnap = await locationsCol
+      .where('owner', '==', userId)
+      .limit(1)
+      .get();
+
+    if (locSnap.empty) {
+      return res.json({
+        stats: { activeGuests: 0, totalGuestsToday: 0 },
+        requestedGuests: [],
+        activeGuests: [],
+        weeklyTraffic: {
+          Monday: 0,
+          Tuesday: 0,
+          Wednesday: 0,
+          Thursday: 0,
+          Friday: 0,
+          Saturday: 0,
+          Sunday: 0,
+        },
+        autoAcceptGuests: false,
+        autoAcceptEnabled: false,
+      });
+    }
+
+    const locDoc = locSnap.docs[0];
+    const locId = locDoc.id;
+    const locData = locDoc.data() || {};
+    const autoAcceptGuests = !!locData.autoAcceptGuests;
+
+    // All visits for this location
+    const visitsSnap = await guestVisitsCol
+      .where('locationId', '==', locId)
+      .get();
+
+    const visits = visitsSnap.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    const dayNames = [
+      'Sunday',
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+    ];
+    const now = new Date();
+    const todayName = dayNames[now.getDay()];
+
+    const requestedGuests = [];
+    const activeGuests = [];
+
+    const weeklyTraffic = {
+      Monday: 0,
+      Tuesday: 0,
+      Wednesday: 0,
+      Thursday: 0,
+      Friday: 0,
+      Saturday: 0,
+      Sunday: 0,
+    };
+
+    visits.forEach((v) => {
+      const status = (v.status || '').toLowerCase();
+
+      if (status === 'requested' || status === 'pending') {
+        requestedGuests.push(v);
+      } else if (status === 'active') {
+        activeGuests.push(v);
+      }
+
+      let visitDay = v.dayOfWeek;
+      if (!visitDay) {
+        const ts = v.createdAt || v.startTime;
+        if (ts && typeof ts.toDate === 'function') {
+          visitDay = dayNames[ts.toDate().getDay()];
+        }
+      }
+
+      if (visitDay && weeklyTraffic[visitDay] !== undefined) {
+        weeklyTraffic[visitDay] += 1;
+      }
+    });
+
+    const totalGuestsToday = visits.filter((v) => {
+      let visitDay = v.dayOfWeek;
+      if (!visitDay) {
+        const ts = v.createdAt || v.startTime;
+        if (ts && typeof ts.toDate === 'function') {
+          visitDay = dayNames[ts.toDate().getDay()];
+        }
+      }
+      return visitDay === todayName;
+    }).length;
+
+    const stats = {
+      activeGuests: activeGuests.length,
+      totalGuestsToday,
+    };
+
+    return res.json({
+      stats,
+      requestedGuests,
+      activeGuests,
+      weeklyTraffic,
+      autoAcceptGuests,
+      autoAcceptEnabled: autoAcceptGuests,
+    });
+  } catch (err) {
+    console.error('GET /partner/analytics error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * POST /api/partner/guests/:visitId/accept
+ * Manually accept a requested guest (status -> active).
+ */
+partnerRouter.post('/guests/:visitId/accept', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { visitId } = req.params;
+
+    const visitRef = guestVisitsCol.doc(visitId);
+    const visitSnap = await visitRef.get();
+
+    if (!visitSnap.exists) {
+      return res.status(404).json({ error: 'Visit not found' });
+    }
+
+    const visit = visitSnap.data() || {};
+    const locationId = visit.locationId;
+
+    if (!locationId) {
+      return res.status(400).json({ error: 'Visit is missing a locationId' });
+    }
+
+    const locRef = locationsCol.doc(locationId);
+    const locSnap = await locRef.get();
+
+    if (!locSnap.exists) {
+      return res.status(404).json({ error: 'Location not found' });
+    }
+
+    const locData = locSnap.data() || {};
+    if (locData.owner !== userId) {
+      return res.status(403).json({
+        error: 'You are not allowed to manage visits for this location',
+      });
+    }
+
+    await visitRef.set(
+      {
+        status: 'active',
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({ id: visitId, status: 'active' });
+  } catch (err) {
+    console.error('POST /partner/guests/:visitId/accept error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * POST /api/partner/guests/:visitId/end
+ * Host/partner ends an active guest visit (status -> completed).
+ */
+partnerRouter.post('/guests/:visitId/end', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { visitId } = req.params;
+
+    const visitRef = guestVisitsCol.doc(visitId);
+    const visitSnap = await visitRef.get();
+
+    if (!visitSnap.exists) {
+      return res.status(404).json({ error: 'Visit not found' });
+    }
+
+    const visit = visitSnap.data() || {};
+    const locationId = visit.locationId;
+
+    if (!locationId) {
+      return res.status(400).json({ error: 'Visit is missing a locationId' });
+    }
+
+    const locRef = locationsCol.doc(locationId);
+    const locSnap = await locRef.get();
+
+    if (!locSnap.exists) {
+      return res.status(404).json({ error: 'Location not found' });
+    }
+
+    const locData = locSnap.data() || {};
+    if (locData.owner !== userId) {
+      return res.status(403).json({
+        error: 'You are not allowed to manage visits for this location',
+      });
+    }
+
+    if (visit.status !== 'active') {
+      return res.status(400).json({ error: 'Visit is not currently active' });
+    }
+
+    const now = FieldValue.serverTimestamp();
+
+    await visitRef.set(
+      {
+        status: 'completed',
+        endTime: now,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+
+    return res.json({ id: visitId, status: 'completed' });
+  } catch (err) {
+    console.error('POST /partner/guests/:visitId/end error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * POST /api/partner/onboard
+ * Starts Stripe Connect onboarding for partner.
+ */
+partnerRouter.post(
+  '/onboard',
+  protect,
+  [
+    body('email').optional().isEmail(),
+    body('firstName').optional().isString(),
+    body('lastName').optional().isString(),
+    body('ssnLast4').optional().isString(),
+    body('dobDay').optional().isInt({ min: 1, max: 31 }),
+    body('dobMonth').optional().isInt({ min: 1, max: 12 }),
+    body('dobYear').optional().isInt({ min: 1900 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const userId = req.user.userId;
+
+      let email = req.body.email;
+      if (!email) {
+        const userDoc = await usersCol.doc(userId).get();
+        email = userDoc.exists ? userDoc.data().email : null;
+      }
+      if (!email) return res.status(400).json({ error: 'Email required' });
+
+      const account = await stripeService.createPartnerAccount(
+        userId,
+        email,
+        req.body
+      );
+
+      await partnersCol.doc(userId).set(
+        {
+          stripeAccountId: account.id,
+          onboardingStatus: 'pending_verification',
+        },
+        { merge: true }
+      );
+
+      return res.json({ success: true, stripeAccountId: account.id });
+    } catch (err) {
+      console.error('POST /partner/onboard error:', err);
+      return res.status(500).json({ error: err.message || 'Stripe error' });
+    }
+  }
+);
+
+/**
+ * POST /api/partner/onboard-link
+ * Ensures a Stripe Connect account exists, then returns a hosted
+ * onboarding link URL so the partner can finish setup in Stripe.
+ */
+partnerRouter.post('/onboard-link', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+
+    // get email from body or users collection
+    let email = req.body.email;
+    if (!email) {
+      const userDoc = await usersCol.doc(userId).get();
+      email = userDoc.exists ? userDoc.data().email : null;
+    }
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
+    }
+
+    // load partner doc
+    const partnerRef = partnersCol.doc(userId);
+    const partnerSnap = await partnerRef.get();
+    const partnerData = partnerSnap.exists ? partnerSnap.data() : {};
+    let { stripeAccountId } = partnerData;
+
+    // 1) If no Stripe account yet, create one
+    if (!stripeAccountId) {
+      const account = await stripeService.createPartnerAccount(
+        userId,
+        email,
+        req.body || {}
+      );
+      stripeAccountId = account.id;
+
+      await partnerRef.set(
+        {
+          stripeAccountId,
+          onboardingStatus: 'pending_verification',
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+
+    // Use the main app URL and hash route for Partner home
+    const FRONTEND_URL =
+      process.env.FRONTEND_URL || 'https://pay2pee.app';
+
+    // For a HashRouter app, this is the safest:
+    const returnUrl = `${FRONTEND_URL}/#/partner`;
+    const refreshUrl = `${FRONTEND_URL}/#/partner`;
+
+    console.log('Stripe returnUrl:', returnUrl);
+
+    const link = await stripeService.createAccountOnboardingLink(
+      stripeAccountId,
+      returnUrl, // return_url
+      refreshUrl // refresh_url
+    );
+
+    return res.json({ url: link.url, frontendUrl: FRONTEND_URL });
+  } catch (err) {
+    console.error('POST /partner/onboard-link error:', err);
+    return res
+      .status(500)
+      .json({ error: err.message || 'Stripe onboarding link error' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────
 // Host router -> /api/host/*
 // ─────────────────────────────────────────────────────────────
@@ -441,34 +767,13 @@ hostRouter.post(
         amount
       );
 
-      // Reload partner doc (for lastPayoutDate, etc.)
       const doc = await partnersCol.doc(partnerId).get();
       const pdata = doc.exists ? doc.data() : {};
-
-      // 🔹 NEW: read Stripe balance again after payout so UI gets fresh number
-      let stripeBalance = null;
-      if (pdata.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
-        try {
-          const bal = await stripe.balance.retrieve({
-            stripeAccount: pdata.stripeAccountId,
-          });
-          const available = Array.isArray(bal.available) ? bal.available : [];
-          const usdAvail =
-            available.find((b) => b.currency === 'usd') || available[0];
-          const amountCents = usdAvail ? usdAvail.amount : 0;
-          stripeBalance = amountCents / 100;
-        } catch (err) {
-          console.error('Error retrieving Stripe balance after payout:', err);
-        }
-      }
 
       return res.json({
         success: true,
         transferId: transfer.id,
-        newBalance:
-          stripeBalance != null
-            ? Number(stripeBalance.toFixed(2))
-            : Number(pdata.pendingPayout || 0),
+        newBalance: Number(pdata.pendingPayout || 0),
         lastPayoutDate: pdata.lastPayoutDate || new Date().toISOString(),
       });
     } catch (err) {
