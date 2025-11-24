@@ -6,7 +6,7 @@ const axios = require('axios');
 const protect = require('../middleware/protect');
 const { admin, firestore } = require('../firebase-admin');
 const stripeService = require('../services/stripeService');
-const { createNotification } = require('./services/notificationService');
+const { createNotification } = require('../services/notificationService');
 
 const usersCol = firestore.collection('users');
 const partnersCol = firestore.collection('partners');

@@ -1,4 +1,4 @@
-// services/notificationService.js
+// server/services/notificationService.js
 const { admin, firestore } = require('../firebase-admin');
 
 const notificationsCol = firestore.collection('notifications');
@@ -25,6 +25,4 @@ async function createNotification({
   });
 }
 
-module.exports = {
-  createNotification,
-};
+module.exports = { createNotification };

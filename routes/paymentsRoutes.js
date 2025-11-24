@@ -5,7 +5,7 @@ const { protect } = require('../middleware/auth'); // assumes req.user = { id, e
 const payments = require('../controllers/paymentsController');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { firestore, admin } = require('../firebase-admin');
-const { createNotification } = require('./services/notificationService');
+const { createNotification } = require('../services/notificationService');
 
 const router = express.Router();
 const guestVisitsCol = firestore.collection('guestVisits');
