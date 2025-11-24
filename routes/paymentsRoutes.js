@@ -1,7 +1,7 @@
 // routes/paymentsRoutes.js
 const express = require('express');
 const { body, validationResult } = require('express-validator');
-const { protect } = require('../middleware/auth'); // assumes req.user = { id, email, stripeCustomerId? }
+const protect = require('../middleware/protect');
 const payments = require('../controllers/paymentsController');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { firestore, admin } = require('../firebase-admin');
