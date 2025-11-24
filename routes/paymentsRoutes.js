@@ -135,6 +135,81 @@ router.get('/subscriptions/:sessionId', protect, async (req, res) => {
 });
 
 /**
+ * POST /api/payments/guest/checkout
+ * Body: { locationId: string, price: number, name?: string }
+ * Creates a Stripe Checkout Session in "payment" mode for a bathroom visit.
+ */
+router.post(
+  '/guest/checkout',
+  protect,
+  [
+    body('locationId', 'locationId is required').notEmpty(),
+    body('price', 'price must be a positive number').isFloat({ min: 0.5 }),
+    body('name').optional().isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const { locationId, price, name } = req.body;
+      const userId = req.user.id || req.user.userId;
+      const email = req.user.email;
+
+      if (!userId) {
+        return res.status(400).json({ error: 'Missing user id' });
+      }
+
+      if (!process.env.CLIENT_URL) {
+        console.warn('CLIENT_URL is not set in environment variables');
+      }
+
+      // Optional: ensure location exists
+      const locSnap = await locationsCol.doc(locationId).get();
+      if (!locSnap.exists) {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      const loc = locSnap.data() || {};
+
+      const unitAmount = Math.round(Number(price) * 100);
+
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        payment_method_types: ['card'],
+        customer_email: email || undefined,
+        line_items: [
+          {
+            price_data: {
+              currency: 'usd',
+              product_data: {
+                name: name || `Bathroom pass - ${loc.name || 'location'}`,
+              },
+              unit_amount: unitAmount,
+            },
+            quantity: 1,
+          },
+        ],
+        metadata: {
+          locationId,
+          userId,
+        },
+        success_url: `${process.env.CLIENT_URL}/mypass?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL}/home`,
+      });
+
+      return res.json({ sessionId: session.id, url: session.url });
+    } catch (err) {
+      console.error('guest checkout error:', err);
+      return res
+        .status(500)
+        .json({ error: err.message || 'Failed to create guest checkout session' });
+    }
+  }
+);
+
+/**
  * GET /api/payments/guest/session/:sessionId
  *
  * 1) Validates the Checkout Session belongs to the logged-in user.
@@ -441,3 +516,4 @@ router.post('/guest/visit/:visitId/end', protect, async (req, res) => {
 });
 
 module.exports = router;
+
