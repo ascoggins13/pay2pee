@@ -1,8 +1,355 @@
+// routes/users.js
 const express = require('express');
+const { body, validationResult } = require('express-validator');
+
 const router = express.Router();
 
+const protect = require('../middleware/protect');
+const { admin, firestore } = require('../firebase-admin');
+
+const usersCol = firestore.collection('users');
+const guestVisitsCol = firestore.collection('guestVisits');
+const locationsCol = firestore.collection('locations');
+const FieldValue = admin.firestore.FieldValue;
+
+/**
+ * Small helper: safely get timestamp -> ISO string
+ */
+function tsToIso(ts) {
+  if (!ts) return null;
+  try {
+    if (typeof ts.toDate === 'function') {
+      return ts.toDate().toISOString();
+    }
+    if (ts instanceof Date) {
+      return ts.toISOString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GET /profile
+ *
+ * Returns the guest's profile data:
+ * - name, email, avatarUrl, jobTitle, memberSince
+ * - preferences
+ * - favorites (resolved from locations collection)
+ * - recentVisits (last 10 visits from guestVisits)
+ * - totalSavings (simple calculated metric)
+ *
+ * This is what the GuestProfile screen should call.
+ */
+router.get('/profile', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Load base user document
+    const userSnap = await usersCol.doc(userId).get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+
+    const name =
+      userData.name ||
+      (userData.email ? userData.email.split('@')[0] : 'Guest');
+    const email = userData.email || null;
+    const avatarUrl = userData.avatarUrl || '';
+    const jobTitle = userData.jobTitle || '';
+    const memberSince =
+      userData.memberSince || (userData.createdAt && tsToIso(userData.createdAt));
+
+    // Preferences stored on user doc as an object
+    const preferences = userData.preferences || {
+      cleanliness: true,
+      accessibility: true,
+      familyFriendly: false,
+      openLate: true,
+    };
+
+    // Favorites stored as an array of location IDs on the user doc
+    const favoriteIds = Array.isArray(userData.favorites)
+      ? userData.favorites
+      : [];
+
+    let favorites = [];
+    if (favoriteIds.length > 0) {
+      const locDocs = await Promise.all(
+        favoriteIds.map((id) => locationsCol.doc(id).get())
+      );
+
+      favorites = locDocs
+        .filter((snap) => snap.exists)
+        .map((snap) => {
+          const loc = snap.data() || {};
+          return {
+            id: snap.id,
+            name: loc.name || 'Bathroom',
+            area: loc.area || null,
+            address: loc.address || null,
+          };
+        });
+    }
+
+    // Recent visits from guestVisits collection
+    const visitsSnap = await guestVisitsCol
+      .where('guestId', '==', userId)
+      .orderBy('createdAt', 'desc')
+      .limit(10)
+      .get();
+
+    const recentVisits = [];
+    let totalSpentCents = 0;
+
+    visitsSnap.forEach((doc) => {
+      const v = doc.data() || {};
+
+      const price =
+        typeof v.price === 'number'
+          ? v.price
+          : typeof v.amount === 'number'
+          ? v.amount
+          : null;
+
+      if (typeof price === 'number') {
+        totalSpentCents += Math.round(price * 100);
+      }
+
+      const reviewRating =
+        typeof v.reviewRating === 'number' ? v.reviewRating : null;
+      const reviewText = typeof v.reviewText === 'string' ? v.reviewText : '';
+
+      recentVisits.push({
+        id: doc.id,
+        locationId: v.locationId || null,
+        name:
+          v.locationName ||
+          (v.location && v.location.name) ||
+          'Bathroom visit',
+        address:
+          v.locationAddress ||
+          (v.location && v.location.address) ||
+          v.address ||
+          '',
+        date: tsToIso(v.createdAt),
+        price: price,
+        features:
+          Array.isArray(v.features) && v.features.length > 0
+            ? v.features
+            : Array.isArray(v.amenities)
+            ? v.amenities
+            : [],
+        photo: v.photoUrl || null,
+        review:
+          reviewRating || reviewText
+            ? {
+                rating: reviewRating,
+                text: reviewText,
+              }
+            : null,
+      });
+    });
+
+    // Simple "savings" metric: 20% of total spent (you can adjust later)
+    const totalSpent = totalSpentCents / 100;
+    const totalSavings = Number((totalSpent * 0.2).toFixed(2));
+
+    return res.json({
+      userId,
+      name,
+      email,
+      avatarUrl,
+      jobTitle,
+      memberSince,
+      preferences,
+      favorites,
+      recentVisits,
+      totalSavings,
+    });
+  } catch (err) {
+    console.error('GET /users/profile error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * POST /preferences
+ *
+ * Save guest restroom preferences on the user document.
+ * Body can be any subset, e.g.:
+ * {
+ *   cleanliness: true,
+ *   accessibility: false,
+ *   familyFriendly: true,
+ *   openLate: true
+ * }
+ */
+router.post(
+  '/preferences',
+  protect,
+  [
+    body('cleanliness').optional().isBoolean(),
+    body('accessibility').optional().isBoolean(),
+    body('familyFriendly').optional().isBoolean(),
+    body('openLate').optional().isBoolean(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const userId = req.user.userId;
+      const prefs = req.body || {};
+
+      // Merge with existing preferences
+      const userSnap = await usersCol.doc(userId).get();
+      const existing = userSnap.exists ? userSnap.data().preferences || {} : {};
+
+      const updated = { ...existing, ...prefs };
+
+      await usersCol.doc(userId).set(
+        {
+          preferences: updated,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return res.json({ preferences: updated });
+    } catch (err) {
+      console.error('POST /users/preferences error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  }
+);
+
+/**
+ * POST /favorites
+ *
+ * Add a favorite location for this guest.
+ * Body:
+ *   { "locationId": "abc123" }
+ *
+ * Favorites are stored as an array of location IDs on the user doc.
+ * We return the updated favorites array, resolved with location names.
+ */
+router.post(
+  '/favorites',
+  protect,
+  [body('locationId').isString().notEmpty()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const userId = req.user.userId;
+      const { locationId } = req.body;
+
+      // Add ID to favorites array
+      await usersCol.doc(userId).set(
+        {
+          favorites: FieldValue.arrayUnion(locationId),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      // Reload user and resolve favorites
+      const userSnap = await usersCol.doc(userId).get();
+      const userData = userSnap.exists ? userSnap.data() : {};
+      const favoriteIds = Array.isArray(userData.favorites)
+        ? userData.favorites
+        : [];
+
+      let favorites = [];
+      if (favoriteIds.length > 0) {
+        const locDocs = await Promise.all(
+          favoriteIds.map((id) => locationsCol.doc(id).get())
+        );
+
+        favorites = locDocs
+          .filter((snap) => snap.exists)
+          .map((snap) => {
+            const loc = snap.data() || {};
+            return {
+              id: snap.id,
+              name: loc.name || 'Bathroom',
+              area: loc.area || null,
+              address: loc.address || null,
+            };
+          });
+      }
+
+      return res.json({ favorites });
+    } catch (err) {
+      console.error('POST /users/favorites error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  }
+);
+
+/**
+ * DELETE /favorites/:locationId
+ *
+ * Remove a favorite location for this guest.
+ */
+router.delete('/favorites/:locationId', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { locationId } = req.params;
+
+    if (!locationId || typeof locationId !== 'string') {
+      return res.status(400).json({ error: 'locationId is required' });
+    }
+
+    await usersCol.doc(userId).set(
+      {
+        favorites: FieldValue.arrayRemove(locationId),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // Reload updated favorites
+    const userSnap = await usersCol.doc(userId).get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+    const favoriteIds = Array.isArray(userData.favorites)
+      ? userData.favorites
+      : [];
+
+    let favorites = [];
+    if (favoriteIds.length > 0) {
+      const locDocs = await Promise.all(
+        favoriteIds.map((id) => locationsCol.doc(id).get())
+      );
+
+      favorites = locDocs
+        .filter((snap) => snap.exists)
+        .map((snap) => {
+          const loc = snap.data() || {};
+          return {
+            id: snap.id,
+            name: loc.name || 'Bathroom',
+            area: loc.area || null,
+            address: loc.address || null,
+          };
+        });
+    }
+
+    return res.json({ favorites });
+  } catch (err) {
+    console.error('DELETE /users/favorites/:locationId error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * Legacy placeholder (optional – you can keep or drop this)
+ */
 router.get('/', (req, res) => {
-  res.send('User route placeholder');
+  res.send('User route: profile, preferences, favorites endpoints are active.');
 });
 
 module.exports = router;
