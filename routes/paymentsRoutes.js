@@ -5,6 +5,7 @@ const { protect } = require('../middleware/auth'); // assumes req.user = { id, e
 const payments = require('../controllers/paymentsController');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { firestore, admin } = require('../firebase-admin');
+const { createNotification } = require('./services/notificationService');
 
 const router = express.Router();
 const guestVisitsCol = firestore.collection('guestVisits');
@@ -14,13 +15,13 @@ const locationsCol = firestore.collection('locations');
  * GET /api/payments/prices
  * Returns normalized active prices (id, name, amount, currency, interval, mode, popular, features[])
  */
-router.get('/prices', async (_req, res) => {
+router.get('/prices', protect, async (req, res) => {
   try {
-    const data = await payments.listActivePrices();
-    res.json(data);
-  } catch (e) {
-    console.error('prices error', e);
-    res.status(500).json({ error: 'Failed to load prices' });
+    const prices = await payments.getNormalizedPrices();
+    res.json({ prices });
+  } catch (err) {
+    console.error('Error fetching prices:', err);
+    res.status(500).json({ error: 'Failed to fetch prices' });
   }
 });
 
@@ -43,7 +44,7 @@ router.post(
       const session = await payments.createCheckoutSession({
         priceId,
         mode: 'subscription',
-        user: req.user, // expects { id, email, stripeCustomerId? }
+        user: req.user,
       });
       res.json({ sessionId: session.id, url: session.url });
     } catch (err) {
@@ -87,149 +88,60 @@ router.post(
 );
 
 /**
- * POST /api/payments/guest/checkout
- * Body: { locationId, price, name? }
- * Creates a Stripe Checkout Session for a single restroom visit
- * UPDATED: routes payment to partner's connected Stripe account with 30% platform fee
+ * GET /api/payments/subscriptions/:sessionId
+ * Returns info about a just-completed subscription checkout session.
  */
-router.post(
-  '/guest/checkout',
-  protect,
-  [
-    body('locationId', 'locationId is required').notEmpty(),
-    body('price', 'price must be a positive number').isFloat({ min: 0.5 }),
-    body('name').optional().isString(),
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+router.get('/subscriptions/:sessionId', protect, async (req, res) => {
+  const { sessionId } = req.params;
 
-    try {
-      const { locationId, price, name } = req.body;
-      const amountInCents = Math.round(Number(price) * 100);
-
-      // 1) Fetch location to get partnerId
-      const locSnap = await locationsCol.doc(locationId).get();
-      if (!locSnap.exists) {
-        return res.status(404).json({ error: 'Location not found' });
-      }
-      const location = locSnap.data();
-      const partnerId = location.owner;
-
-      if (!partnerId) {
-        return res
-          .status(400)
-          .json({ error: 'Location missing partner owner' });
-      }
-
-      // 2) Fetch partner to get stripeAccountId (connected account)
-      const partnerSnap = await firestore
-        .collection('partners')
-        .doc(partnerId)
-        .get();
-      if (!partnerSnap.exists) {
-        return res.status(404).json({ error: 'Partner not found' });
-      }
-
-      const partnerData = partnerSnap.data();
-      const stripeAccountId = partnerData.stripeAccountId;
-
-      if (!stripeAccountId) {
-        return res.status(400).json({
-          error: 'Partner does not have a connected Stripe account yet',
-        });
-      }
-
-      // 3) Apply your 30% platform fee
-      const platformFeePercent = 0.30;
-      const applicationFeeAmount = Math.round(
-        amountInCents * platformFeePercent
-      );
-
-      // 4) Create destination-charge Checkout Session
-      const session = await stripe.checkout.sessions.create({
-        mode: 'payment',
-        payment_method_types: ['card'],
-        line_items: [
-          {
-            price_data: {
-              currency: 'usd',
-              unit_amount: amountInCents,
-              product_data: {
-                name: name || 'Pay2Pee restroom pass',
-              },
-            },
-            quantity: 1,
-          },
-        ],
-        customer_email: req.user.email,
-        metadata: {
-          type: 'guest_pass',
-          locationId,
-          partnerId,
-          userId: req.user.id || req.user.userId || '',
-        },
-        payment_intent_data: {
-          application_fee_amount: applicationFeeAmount, // your 30% cut
-          transfer_data: {
-            destination: stripeAccountId, // partner receives the rest
-          },
-        },
-        // HashRouter-aware success/cancel URLs
-        success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.CLIENT_URL}/#/`,
-      });
-
-      res.json({ sessionId: session.id, url: session.url });
-    } catch (err) {
-      console.error('guest checkout error:', err);
-      res.status(500).json({
-        error: err.message || 'Failed to create guest checkout session',
-      });
-    }
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' });
   }
-);
 
-/**
- * POST /api/payments/portal
- * Opens Stripe Billing Portal for the logged-in user (must have stripeCustomerId)
- */
-router.post('/portal', protect, async (req, res) => {
   try {
-    const portal = await payments.createBillingPortalSession({ user: req.user });
-    res.json({ url: portal.url });
-  } catch (err) {
-    console.error('billing portal error:', err);
-    res
-      .status(400)
-      .json({ error: err.message || 'Failed to create billing portal session' });
-  }
-});
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['subscription'],
+    });
 
-/**
- * (Optional) GET /api/payments/config
- * Returns your publishable key to the client (handy for sanity checks)
- */
-router.get('/config', (_req, res) => {
-  res.json({
-    publishableKey:
-      process.env.REACTIVE_APP_STRIPE_PK ||
-      process.env.REACT_APP_STRIPE_PK ||
-      '',
-  });
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Quick sanity check to ensure user is the rightful owner of this session
+    if (
+      session.customer_email &&
+      req.user.email &&
+      session.customer_email.toLowerCase() !== req.user.email.toLowerCase()
+    ) {
+      return res
+        .status(403)
+        .json({ error: 'Session does not belong to this user' });
+    }
+
+    // Minimal response including subscription details
+    res.json({
+      sessionId: session.id,
+      subscriptionId: session.subscription,
+      status: session.payment_status,
+      amountTotal: session.amount_total,
+      currency: session.currency,
+    });
+  } catch (err) {
+    console.error('subscription session lookup error:', err);
+    res
+      .status(500)
+      .json({ error: 'Failed to load subscription session details' });
+  }
 });
 
 /**
  * GET /api/payments/guest/session/:sessionId
  *
- * Used by MyPass page:
- *  - Verifies session with Stripe
- *  - Creates a guestVisits document if not already created for this session
- *  - Applies auto-accept + duration
- *  - Lazily expires visits if time is up
- *  - Returns session, location, and visit info
+ * 1) Validates the Checkout Session belongs to the logged-in user.
+ * 2) Resolves the associated location from Firestore.
+ * 3) Either:
+ *    - Returns an existing visit (if one is already linked to this session), OR
+ *    - Creates a new visit if payment is complete and no visit exists.
  */
 router.get('/guest/session/:sessionId', protect, async (req, res) => {
   const { sessionId } = req.params;
@@ -266,7 +178,7 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
     if (!locationId) {
       return res
         .status(400)
-        .json({ error: 'Session is missing locationId metadata' });
+        .json({ error: 'Session metadata missing locationId' });
     }
 
     // 2) Fetch location info
@@ -314,8 +226,7 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
           await guestVisitsCol.doc(docId).set(
             {
               status: 'expired',
-              endTime: admin.firestore.Timestamp.fromDate(expDate),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.Timestamp.now(),
             },
             { merge: true }
           );
@@ -334,9 +245,13 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       const doc = existingVisitSnap.docs[0];
       let data = doc.data() || {};
       data = await maybeExpireVisit(doc.id, data);
-      visitDoc = { id: doc.id, ...data };
+
+      visitDoc = {
+        id: doc.id,
+        ...data,
+      };
     } else {
-      // No visit yet for this session
+      // No existing visit – check if the session is fully paid
       const isPaid =
         session.payment_status === 'paid' ||
         session.payment_status === 'no_payment_required';
@@ -388,6 +303,53 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       const newRef = await guestVisitsCol.add(visitData);
       const newSnap = await newRef.get();
       visitDoc = { id: newRef.id, ...newSnap.data() };
+
+      // Notifications: guest booking confirmed, time warning, and partner new booking
+      try {
+        // Guest: booking confirmed
+        await createNotification({
+          userId,
+          userType: 'guest',
+          type: 'GUEST_BOOKING_CONFIRMED',
+          title: 'Bathroom booked',
+          body: `Your visit to ${location.name || 'this bathroom'} is confirmed.`,
+          data: {
+            guestVisitId: newRef.id,
+            locationId,
+          },
+        });
+
+        // Guest: time almost up (frontend can highlight based on expiresAt)
+        await createNotification({
+          userId,
+          userType: 'guest',
+          type: 'GUEST_TIME_WARNING',
+          title: 'Time almost up',
+          body: `Your visit to ${location.name || 'this bathroom'} is almost over.`,
+          data: {
+            guestVisitId: newRef.id,
+            locationId,
+            expiresAt,
+          },
+        });
+
+        // Partner: new booking
+        if (partnerId) {
+          await createNotification({
+            userId: partnerId,
+            userType: 'partner',
+            type: 'PARTNER_NEW_BOOKING',
+            title: 'New booking',
+            body: 'A guest just booked your bathroom.',
+            data: {
+              guestVisitId: newRef.id,
+              locationId,
+            },
+          });
+        }
+      } catch (notifyErr) {
+        console.error('Error creating booking notifications:', notifyErr);
+      }
     }
 
     return res.json({
@@ -448,6 +410,23 @@ router.post('/guest/visit/:visitId/end', protect, async (req, res) => {
       { merge: true }
     );
 
+    // Notification: guest thank-you after visit
+    try {
+      await createNotification({
+        userId,
+        userType: 'guest',
+        type: 'GUEST_THANK_YOU',
+        title: 'Thanks for your visit',
+        body: 'Thanks for using Pay2Pee today.',
+        data: {
+          guestVisitId: visitId,
+          locationId: visit.locationId || null,
+        },
+      });
+    } catch (notifyErr) {
+      console.error('Error creating thank-you notification:', notifyErr);
+    }
+
     return res.json({
       id: visitId,
       status: 'completed',
@@ -462,4 +441,3 @@ router.post('/guest/visit/:visitId/end', protect, async (req, res) => {
 });
 
 module.exports = router;
-

@@ -65,6 +65,11 @@ if (partnerModule.hostRouter) {
   app.use('/api/host', partnerModule.hostRouter);
 }
 
+const notificationsRoutes = require('./routes/notificationsRoutes');
+app.use('/api/notifications', notificationsRoutes);
+
+
+
 /* ---------------------- HEALTHCHECK ----------------------- */
 
 app.get('/api/health', (_req, res) => {
