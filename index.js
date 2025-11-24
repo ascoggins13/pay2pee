@@ -68,6 +68,9 @@ if (partnerModule.hostRouter) {
 const notificationsRoutes = require('./routes/notificationsRoutes');
 app.use('/api/notifications', notificationsRoutes);
 
+const chatRoutes = require('./routes/chatRoutes');
+
+app.use('/api/chat', chatRoutes);
 
 
 /* ---------------------- HEALTHCHECK ----------------------- */

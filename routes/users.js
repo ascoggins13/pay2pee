@@ -93,7 +93,7 @@ router.get('/profile', protect, async (req, res) => {
 
     // Recent visits from guestVisits collection
     const visitsSnap = await guestVisitsCol
-      .where('guestId', '==', userId)
+      .where('userId', '==', userId) // ✅ was 'guestId'
       .orderBy('createdAt', 'desc')
       .limit(10)
       .get();
@@ -104,15 +104,25 @@ router.get('/profile', protect, async (req, res) => {
     visitsSnap.forEach((doc) => {
       const v = doc.data() || {};
 
-      const price =
-        typeof v.price === 'number'
-          ? v.price
-          : typeof v.amount === 'number'
-          ? v.amount
-          : null;
+      let price = null;
 
-      if (typeof price === 'number') {
-        totalSpentCents += Math.round(price * 100);
+      // ✅ Prefer Stripe amountTotal (cents)
+      if (typeof v.amountTotal === 'number') {
+        price = v.amountTotal / 100;
+        totalSpentCents += v.amountTotal;
+      } else {
+        // Legacy fields in dollars
+        const rawPrice =
+          typeof v.price === 'number'
+            ? v.price
+            : typeof v.amount === 'number'
+            ? v.amount
+            : null;
+
+        if (typeof rawPrice === 'number') {
+          price = rawPrice;
+          totalSpentCents += Math.round(rawPrice * 100);
+        }
       }
 
       const reviewRating =
@@ -325,7 +335,7 @@ router.delete('/favorites/:locationId', protect, async (req, res) => {
         favoriteIds.map((id) => locationsCol.doc(id).get())
       );
 
-      favorites = locDocs
+        favorites = locDocs
         .filter((snap) => snap.exists)
         .map((snap) => {
           const loc = snap.data() || {};
@@ -353,3 +363,4 @@ router.get('/', (req, res) => {
 });
 
 module.exports = router;
+
