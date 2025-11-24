@@ -341,6 +341,62 @@ partnerRouter.get('/analytics', protect, async (req, res) => {
 });
 
 /**
+ * ✅ NEW: GET /api/partner/summary
+ * Alias used by PartnerHomeScreen – combines analytics + basic payout info.
+ */
+partnerRouter.get('/summary', protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // 1) Analytics from guestVisits
+    const snap = await guestVisitsCol.where('partnerId', '==', userId).get();
+
+    let totalVisits = 0;
+    let activeVisits = 0;
+    let completedVisits = 0;
+    let expiredVisits = 0;
+    let totalRevenue = 0;
+
+    snap.forEach((doc) => {
+      const v = doc.data() || {};
+      totalVisits += 1;
+
+      if (v.status === 'active') activeVisits += 1;
+      if (v.status === 'completed') completedVisits += 1;
+      if (v.status === 'expired') expiredVisits += 1;
+
+      if (typeof v.amountTotal === 'number') {
+        totalRevenue += v.amountTotal;
+      }
+    });
+
+    const totalRevenueDollars = totalRevenue / 100;
+
+    // 2) Pull partner payout summary (balance, pending, lifetime)
+    const partnerDoc = await partnersCol.doc(userId).get();
+    const pdata = partnerDoc.exists ? partnerDoc.data() || {} : {};
+
+    return res.json({
+      summary: {
+        totalVisits,
+        activeVisits,
+        completedVisits,
+        expiredVisits,
+        totalRevenue: totalRevenueDollars,
+      },
+      partner: {
+        stripeBalance: pdata.stripeBalance || 0,
+        pendingPayout: pdata.pendingPayout || 0,
+        lifetimeEarnings: pdata.lifetimeEarnings || 0,
+      },
+    });
+  } catch (err) {
+    console.error('GET /partner/summary error:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
  * GET /api/partner/guests
  * Lists visits for a specific partner, optionally filtered by status.
  */
@@ -709,3 +765,4 @@ hostRouter.post(
 );
 
 module.exports = { partnerRouter, hostRouter };
+
