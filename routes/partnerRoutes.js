@@ -6,6 +6,7 @@ const axios = require('axios');
 const protect = require('../middleware/protect');
 const { admin, firestore } = require('../firebase-admin');
 const stripeService = require('../services/stripeService');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const usersCol = firestore.collection('users');
 const partnersCol = firestore.collection('partners');
@@ -116,6 +117,43 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       }
     }
 
+    // 🔹 Fetch Stripe balance (available vs pending) for this partner
+    let stripeBalanceTotal = null;
+    let stripeAvailable = null;
+    let stripePending = null;
+
+    if (partner.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
+      try {
+        const bal = await stripe.balance.retrieve({
+          stripeAccount: partner.stripeAccountId,
+        });
+
+        const avail = Array.isArray(bal.available) ? bal.available[0] : null;
+        const pend = Array.isArray(bal.pending) ? bal.pending[0] : null;
+
+        stripeAvailable = avail ? avail.amount / 100 : 0; // dollars
+        stripePending = pend ? pend.amount / 100 : 0; // dollars
+        stripeBalanceTotal = (stripeAvailable || 0) + (stripePending || 0);
+      } catch (err) {
+        console.error(
+          'Error fetching Stripe balance in /partner/summary:',
+          err
+        );
+      }
+    }
+
+    // Fallback to old behavior if Stripe balance not available
+    const totalBalance =
+      stripeBalanceTotal !== null
+        ? stripeBalanceTotal
+        : Number(partner.pendingPayout || 0);
+
+    const availableBalance =
+      stripeAvailable !== null ? stripeAvailable : totalBalance;
+
+    const pendingBalance =
+      stripePending !== null ? stripePending : null;
+
     // 🔹 Compute today's guests from guestVisits (for PartnerHomeScreen)
     let todayCount = 0;
     if (locId) {
@@ -165,9 +203,17 @@ partnerRouter.get('/summary', protect, async (req, res) => {
         'Add your address so guests can find you.',
       isActive: loc.isActive !== false,
 
-      // 🔹 Use computed value instead of loc.todayVisits
+      // 🔹 Use computed todayVisits + Stripe balances
       todayVisits: todayCount,
-      currentBalance: Number(partner.pendingPayout || 0),
+
+      // balances (Stripe-backed where available)
+      currentBalance: totalBalance,
+      availableBalance,
+      pendingBalance,
+      stripeBalance: totalBalance,
+      stripeAvailableBalance: availableBalance,
+      stripePendingBalance: pendingBalance,
+
       lastPayoutDate: partner.lastPayoutDate || null,
       rating: loc.rating || 4.8,
 
