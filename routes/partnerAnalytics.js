@@ -33,7 +33,7 @@ router.get('/analytics', requireAuth, async (req, res) => {
       .where('createdAt', '<=', endTs)
       .get();
 
-    // active guests
+    // active guests (all-time, for active list + activeGuests stat)
     const activeSnap = await guestVisitsRef
       .where('partnerId', '==', partnerId)
       .where('status', '==', 'active')
@@ -49,6 +49,18 @@ router.get('/analytics', requireAuth, async (req, res) => {
       ...doc.data(),
     }));
 
+    // 🔹 Count how many active guests were created today
+    const activeTodayCount = activeGuests.filter((g) => {
+      const raw = g.createdAt;
+      if (!raw) return false;
+
+      const createdAt = raw.toDate
+        ? raw.toDate()
+        : new Date(raw);
+
+      return createdAt >= startOfToday && createdAt <= endOfToday;
+    }).length;
+
     // Simple weekly traffic (last 7 days)
     const sevenDaysAgo = new Date(now);
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
@@ -63,9 +75,12 @@ router.get('/analytics', requireAuth, async (req, res) => {
 
     weeklySnap.forEach((doc) => {
       const data = doc.data();
-      const createdAt = data.createdAt?.toDate
-        ? data.createdAt.toDate()
-        : new Date(data.createdAt);
+      const raw = data.createdAt;
+      if (!raw) return;
+
+      const createdAt = raw.toDate
+        ? raw.toDate()
+        : new Date(raw);
 
       const jsDay = createdAt.getDay();     // 0=Sun..6=Sat
       const index = (jsDay + 6) % 7;        // 0=Mon..6=Sun
@@ -77,9 +92,11 @@ router.get('/analytics', requireAuth, async (req, res) => {
       value: count,
     }));
 
+    // 🔹 activeGuests = all currently active
+    // 🔹 totalGuestsToday = requested today + active created today (includes auto-accept)
     const stats = {
       activeGuests: activeGuests.length,
-      totalGuestsToday: activeGuests.length + requestedGuests.length,
+      totalGuestsToday: requestedSnap.size + activeTodayCount,
     };
 
     return res.json({
