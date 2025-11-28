@@ -10,25 +10,34 @@ const app = express();
 
 /* ---------------------- CORS SETUP ------------------------ */
 
-const allowedOrigins = [
+const allowedOriginsExact = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'https://pay2pee.app',
-  'capacitor://localhost',     // ✅ Allow Capacitor Android / iOS
-  'http://localhost',          // ✅ WebView fallback
 ];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow mobile apps, curl, server-to-server
+      // Allow same-origin / tools / mobile where origin may be null
       if (!origin) return callback(null, true);
 
-      if (allowedOrigins.includes(origin)) {
+      const isExactAllowed = allowedOriginsExact.includes(origin);
+
+      // ✅ Allow any Capacitor origin (Android/iOS)
+      const isCapacitor =
+        origin.startsWith('capacitor://');
+
+      // ✅ Allow any localhost WebView variant (ports, etc.)
+      const isLocalhostWebView =
+        origin.startsWith('http://localhost') ||
+        origin.startsWith('http://10.0.2.2');
+
+      if (isExactAllowed || isCapacitor || isLocalhostWebView) {
         return callback(null, true);
       }
 
-      console.log('❌ Blocked by CORS:', origin);
+      console.log('❌ Blocked by CORS origin:', origin);
       return callback(null, false);
     },
     credentials: true,
@@ -38,8 +47,9 @@ app.use(
   })
 );
 
-// Handle preflight
+// Handle preflight (OPTIONS) for all routes
 app.options('*', cors());
+
 
 
 /* -------------------- BASIC MIDDLEWARE -------------------- */
