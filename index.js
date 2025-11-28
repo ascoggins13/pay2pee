@@ -8,47 +8,9 @@ const path = require('path');
 
 const app = express();
 
-/* ---------------------- CORS SETUP ------------------------ */
-
-const allowedOriginsExact = [
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
-  'https://pay2pee.app',
-];
-
-app.use(
-  cors({
-    origin(origin, callback) {
-      // Allow same-origin / tools / mobile where origin may be null
-      if (!origin) return callback(null, true);
-
-      const isExactAllowed = allowedOriginsExact.includes(origin);
-
-      // ✅ Allow any Capacitor origin (Android/iOS)
-      const isCapacitor =
-        origin.startsWith('capacitor://');
-
-      // ✅ Allow any localhost WebView variant (ports, etc.)
-      const isLocalhostWebView =
-        origin.startsWith('http://localhost') ||
-        origin.startsWith('http://10.0.2.2');
-
-      if (isExactAllowed || isCapacitor || isLocalhostWebView) {
-        return callback(null, true);
-      }
-
-      console.log('❌ Blocked by CORS origin:', origin);
-      return callback(null, false);
-    },
-    credentials: true,
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    allowedHeaders:
-      'Origin,X-Requested-With,Content-Type,Accept,Authorization',
-  })
-);
-
-// Handle preflight (OPTIONS) for all routes
+app.use(cors());
 app.options('*', cors());
+
 
 
 
