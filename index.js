@@ -14,15 +14,21 @@ const allowedOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'https://pay2pee.app',
+  'capacitor://localhost',     // ✅ Allow Capacitor Android / iOS
+  'http://localhost',          // ✅ WebView fallback
 ];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // allow same-origin / non-browser clients
+      // Allow mobile apps, curl, server-to-server
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      // you can hard-block unknown origins by returning an error here instead
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log('❌ Blocked by CORS:', origin);
       return callback(null, false);
     },
     credentials: true,
@@ -34,6 +40,7 @@ app.use(
 
 // Handle preflight
 app.options('*', cors());
+
 
 /* -------------------- BASIC MIDDLEWARE -------------------- */
 
