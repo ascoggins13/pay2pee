@@ -195,8 +195,9 @@ router.post(
           locationId,
           userId,
         },
-        success_url: `${process.env.CLIENT_URL}/mypass?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.CLIENT_URL}/home`,
+        success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
+cancel_url: `${process.env.CLIENT_URL}/#/home`,
+
       });
 
       return res.json({ sessionId: session.id, url: session.url });
