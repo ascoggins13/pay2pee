@@ -6,6 +6,8 @@ const protect = require("../middleware/protect");
 
 const router = express.Router();
 const locationsCol = firestore.collection("locations");
+// 🔹 NEW: guest visits collection so we can count today's visitors
+const guestVisitsCol = firestore.collection("guestVisits");
 
 /* ─────────────────────────────────────────────
  * GET /api/locations/nearby
@@ -14,7 +16,7 @@ const locationsCol = firestore.collection("locations");
  *   lat, lng, radiusKm – IGNORED for now, we just return active locations.
  *
  * Returns:
- *   { locations: [ { id, ...doc.data() }, ... ] }
+ *   { locations: [ { id, ...doc.data(), todayVisitCount }, ... ] }
  * ────────────────────────────────────────────*/
 router.get("/nearby", async (req, res) => {
   try {
@@ -42,7 +44,45 @@ router.get("/nearby", async (req, res) => {
       }
     });
 
-    return res.json({ locations });
+    // 🔹 NEW: aggregate today's visit counts by locationId
+    const now = new Date();
+    const startOfDay = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    );
+
+    const countsByLocation = {};
+
+    try {
+      const visitsSnap = await guestVisitsCol
+        .where(
+          "createdAt",
+          ">=",
+          admin.firestore.Timestamp.fromDate(startOfDay)
+        )
+        .get();
+
+      visitsSnap.forEach((visitDoc) => {
+        const v = visitDoc.data() || {};
+        const locId = v.locationId;
+        if (!locId) return;
+
+        // If you want to filter by status, uncomment this:
+        // if (!["active", "completed", "expired"].includes(v.status)) return;
+
+        countsByLocation[locId] = (countsByLocation[locId] || 0) + 1;
+      });
+    } catch (visitErr) {
+      console.error("Error aggregating today visit counts:", visitErr);
+    }
+
+    const enriched = locations.map((loc) => ({
+      ...loc,
+      todayVisitCount: countsByLocation[loc.id] || 0,
+    }));
+
+    return res.json({ locations: enriched });
   } catch (err) {
     console.error("GET /locations/nearby error:", err);
     return res.status(500).json({ error: "Server error" });

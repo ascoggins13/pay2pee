@@ -202,11 +202,9 @@ router.post(
       return res.json({ sessionId: session.id, url: session.url });
     } catch (err) {
       console.error('guest checkout error:', err);
-      return res
-        .status(500)
-        .json({
-          error: err.message || 'Failed to create guest checkout session',
-        });
+      return res.status(500).json({
+        error: err.message || 'Failed to create guest checkout session',
+      });
     }
   }
 );
@@ -437,6 +435,29 @@ router.get('/guest/session/:sessionId', async (req, res) => {
       }
     }
 
+    // 🔹 NEW: compute queuePosition + guestsAhead for this visit
+    let queuePosition = null;
+    let guestsAhead = null;
+
+    try {
+      if (visitDoc && visitDoc.locationId) {
+        const queueSnap = await guestVisitsCol
+          .where('locationId', '==', visitDoc.locationId)
+          .where('status', 'in', ['pending', 'active'])
+          .orderBy('createdAt', 'asc')
+          .get();
+
+        const queue = queueSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const idx = queue.findIndex((v) => v.id === visitDoc.id);
+        if (idx !== -1) {
+          queuePosition = idx + 1;
+          guestsAhead = idx;
+        }
+      }
+    } catch (queueErr) {
+      console.error('Error computing queue for visit:', queueErr);
+    }
+
     return res.json({
       session: {
         id: session.id,
@@ -446,6 +467,9 @@ router.get('/guest/session/:sessionId', async (req, res) => {
       },
       location,
       visit: visitDoc,
+      // 🔹 NEW fields for MyPass queue display
+      queuePosition,
+      guestsAhead,
     });
   } catch (err) {
     console.error('guest session lookup error:', err);
