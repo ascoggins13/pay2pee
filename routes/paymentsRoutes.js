@@ -196,8 +196,7 @@ router.post(
           userId,
         },
         success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
-cancel_url: `${process.env.CLIENT_URL}/#/home`,
-
+        cancel_url: `${process.env.CLIENT_URL}/#/home`,
       });
 
       return res.json({ sessionId: session.id, url: session.url });
@@ -205,7 +204,9 @@ cancel_url: `${process.env.CLIENT_URL}/#/home`,
       console.error('guest checkout error:', err);
       return res
         .status(500)
-        .json({ error: err.message || 'Failed to create guest checkout session' });
+        .json({
+          error: err.message || 'Failed to create guest checkout session',
+        });
     }
   }
 );
@@ -213,13 +214,16 @@ cancel_url: `${process.env.CLIENT_URL}/#/home`,
 /**
  * GET /api/payments/guest/session/:sessionId
  *
- * 1) Validates the Checkout Session belongs to the logged-in user.
+ * 1) Validates the Checkout Session via Stripe.
  * 2) Resolves the associated location from Firestore.
  * 3) Either:
  *    - Returns an existing visit (if one is already linked to this session), OR
  *    - Creates a new visit if payment is complete and no visit exists.
+ *
+ * NOTE: This route is intentionally NOT protected so it can be called
+ * from Stripe redirects (e.g. in-app browser) where no JWT is available.
  */
-router.get('/guest/session/:sessionId', protect, async (req, res) => {
+router.get('/guest/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
 
   if (!sessionId) {
@@ -236,11 +240,12 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // Ensure the session belongs to this user
+    // Optional sanity check if a user is attached (web / Android with JWT)
+    const requestEmail = req.user?.email;
     if (
       session.customer_email &&
-      req.user.email &&
-      session.customer_email.toLowerCase() !== req.user.email.toLowerCase()
+      requestEmail &&
+      session.customer_email.toLowerCase() !== requestEmail.toLowerCase()
     ) {
       return res
         .status(403)
@@ -249,7 +254,8 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
 
     const metadata = session.metadata || {};
     const locationId = metadata.locationId;
-    const userId = metadata.userId || req.user.id || req.user.userId;
+    const userId =
+      metadata.userId || req.user?.id || req.user?.userId || null;
 
     if (!locationId) {
       return res
@@ -262,7 +268,9 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
     const locSnap = await locRef.get();
 
     if (!locSnap.exists) {
-      return res.status(404).json({ error: 'Location not found for this pass' });
+      return res
+        .status(404)
+        .json({ error: 'Location not found for this pass' });
     }
 
     const location = { id: locSnap.id, ...locSnap.data() };
@@ -347,8 +355,7 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       }
 
       // Payment is complete – create a new visit
-      // P2P VIP: short, high-rotation window under 10 minutes
-      const maxDurationMinutes = 8; // tweak here if you ever want 7 / 9 / 10
+      const maxDurationMinutes = 8; // short high-rotation window
       const expiresAt = admin.firestore.Timestamp.fromMillis(
         now.toMillis() + maxDurationMinutes * 60 * 1000
       );
@@ -383,31 +390,33 @@ router.get('/guest/session/:sessionId', protect, async (req, res) => {
       // Notifications: guest booking confirmed, time warning, and partner new booking
       try {
         // Guest: booking confirmed
-        await createNotification({
-          userId,
-          userType: 'guest',
-          type: 'GUEST_BOOKING_CONFIRMED',
-          title: 'Bathroom booked',
-          body: `Your visit to ${location.name || 'this bathroom'} is confirmed.`,
-          data: {
-            guestVisitId: newRef.id,
-            locationId,
-          },
-        });
+        if (userId) {
+          await createNotification({
+            userId,
+            userType: 'guest',
+            type: 'GUEST_BOOKING_CONFIRMED',
+            title: 'Bathroom booked',
+            body: `Your visit to ${location.name || 'this bathroom'} is confirmed.`,
+            data: {
+              guestVisitId: newRef.id,
+              locationId,
+            },
+          });
 
-        // Guest: time almost up (frontend can highlight based on expiresAt)
-        await createNotification({
-          userId,
-          userType: 'guest',
-          type: 'GUEST_TIME_WARNING',
-          title: 'Time almost up',
-          body: `Your visit to ${location.name || 'this bathroom'} is almost over.`,
-          data: {
-            guestVisitId: newRef.id,
-            locationId,
-            expiresAt,
-          },
-        });
+          // Guest: time almost up
+          await createNotification({
+            userId,
+            userType: 'guest',
+            type: 'GUEST_TIME_WARNING',
+            title: 'Time almost up',
+            body: `Your visit to ${location.name || 'this bathroom'} is almost over.`,
+            data: {
+              guestVisitId: newRef.id,
+              locationId,
+              expiresAt,
+            },
+          });
+        }
 
         // Partner: new booking
         if (partnerId) {
@@ -517,4 +526,3 @@ router.post('/guest/visit/:visitId/end', protect, async (req, res) => {
 });
 
 module.exports = router;
-
