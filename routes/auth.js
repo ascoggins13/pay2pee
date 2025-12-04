@@ -2,7 +2,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { admin, firestore } = require('../firebase-admin'); // <-- use shared instance
+const { admin, firestore } = require('../firebase-admin');
 
 const router = express.Router();
 
@@ -16,31 +16,41 @@ const now = () => admin.firestore.FieldValue.serverTimestamp();
 function issueJwt({ userId, email, userType }) {
   return jwt.sign({ userId, email, userType }, JWT_SECRET, { expiresIn: '7d' });
 }
+
 function successAuthPayload({ id, name, userType, email }) {
   const token = issueJwt({ userId: id, email, userType });
   return { success: true, token, userId: id, userType, name };
 }
 
+// ========================
 // POST /api/auth/register
+// ========================
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password, userType } = req.body || {};
     if (!name || !email || !password || !userType) {
       return res.status(400).json({ success: false, error: 'Missing fields' });
     }
+
     const emailNorm = normalizeEmail(email);
     const typeNorm = String(userType).toLowerCase();
+
     if (!['user', 'partner'].includes(typeNorm)) {
       return res.status(400).json({ success: false, error: 'Invalid userType' });
     }
 
-    const existingSnap = await usersCol.where('emailLower', '==', emailNorm).limit(1).get();
+    const existingSnap = await usersCol
+      .where('emailLower', '==', emailNorm)
+      .limit(1)
+      .get();
+
     if (!existingSnap.empty) {
       return res.status(409).json({ success: false, error: 'Email already registered' });
     }
 
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
     const docRef = usersCol.doc();
+
     await docRef.set({
       name: name.trim(),
       email: email.trim(),
@@ -66,38 +76,60 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// =====================
 // POST /api/auth/login
+// =====================
 router.post('/login', async (req, res) => {
   try {
     const { email, password, userType } = req.body || {};
     if (!email || !password || !userType) {
       return res.status(400).json({ success: false, error: 'Missing fields' });
     }
-    const emailNorm = normalizeEmail(email);
-    const typeAttempt = String(userType).toLowerCase();
 
-    const snap = await usersCol.where('emailLower', '==', emailNorm).limit(1).get();
+    const emailNorm = normalizeEmail(email);
+    const typeAttempt = String(userType || '').toLowerCase();
+
+    const snap = await usersCol
+      .where('emailLower', '==', emailNorm)
+      .limit(1)
+      .get();
+
     if (snap.empty) {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
     const doc = snap.docs[0];
     const user = { id: doc.id, ...doc.data() };
+    const storedType = String(user.userType || '').toLowerCase();
 
-    if (user.userType !== typeAttempt) {
+    // ✅ SAFETY FIX:
+    // Partners MUST log in as partner
+    if (storedType === 'partner' && typeAttempt !== 'partner') {
       return res.status(403).json({
         success: false,
-        error: 'Account type mismatch. Please log in with the correct account type.',
-        correctUserType: user.userType,
+        error: 'This is a partner account. Please log in using the Partner option.',
+        correctUserType: 'partner',
+      });
+    }
+
+    // Users CANNOT log in as partner
+    if (typeAttempt === 'partner' && storedType !== 'partner') {
+      return res.status(403).json({
+        success: false,
+        error: 'This is not a partner account. Please log in as a guest.',
+        correctUserType: storedType,
       });
     }
 
     const ok = await bcrypt.compare(password, user.passwordHash || '');
     if (!ok) {
-      return res.status(401).json({ success: false, error: 'Invalid email or password' });
+      return res
+        .status(401)
+        .json({ success: false, error: 'Invalid email or password' });
     }
 
     doc.ref.update({ lastActive: now() }).catch(() => {});
+
     return res.json(
       successAuthPayload({
         id: user.id,
