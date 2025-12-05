@@ -252,43 +252,132 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
 /**
  * GET /api/partner/analytics
- * Basic analytics for charts, if needed separately.
+ *
+ * Returns analytics in the exact shape expected by PartnerAnalytics.js:
+ * - stats: { activeGuests, totalGuestsToday }
+ * - requestedGuests: today's requested visits
+ * - activeGuests: all active visits
+ * - weeklyTraffic: [{ day: 'Mon', value: N }, ...]
+ * - autoAcceptGuests: boolean (from location, defaults true)
  */
 partnerRouter.get('/analytics', protect, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const partnerId = req.user.userId || req.user.id;
+    if (!partnerId) {
+      return res.status(400).json({ error: 'Missing partner id' });
+    }
 
-    const snap = await guestVisitsCol.where('partnerId', '==', userId).get();
+    // Load all visits for this partner (guestVisits.partnerId set in payments flow)
+    const visitsSnap = await guestVisitsCol
+      .where('partnerId', '==', partnerId)
+      .get();
 
-    let totalVisits = 0;
-    let activeVisits = 0;
-    let completedVisits = 0;
-    let expiredVisits = 0;
-    let totalRevenue = 0;
+    const visits = visitsSnap.docs.map((d) => ({
+      id: d.id,
+      ...d.data(),
+    }));
 
-    snap.forEach((doc) => {
-      const v = doc.data() || {};
-      totalVisits += 1;
+    const now = new Date();
+    const dayNames = [
+      'Sunday',
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+    ];
+    const todayName = dayNames[now.getDay()];
 
-      if (v.status === 'active') activeVisits += 1;
-      if (v.status === 'completed') completedVisits += 1;
-      if (v.status === 'expired') expiredVisits += 1;
+    // Requested guests for *today* (used for the "Requested" list)
+    const requestedGuests = visits.filter((v) => {
+      if (v.status !== 'requested') return false;
 
-      if (typeof v.amountTotal === 'number') {
-        totalRevenue += v.amountTotal;
+      // Prefer dayOfWeek if present
+      if (v.dayOfWeek) {
+        return v.dayOfWeek === todayName;
       }
+
+      const ts = v.createdAt || v.startTime;
+      if (ts && typeof ts.toDate === 'function') {
+        const dt = ts.toDate();
+        return dt.toDateString() === now.toDateString();
+      }
+      return false;
     });
 
-    const totalRevenueDollars = totalRevenue / 100;
+    // All active guests (used for "Currently in your bathroom")
+    const activeGuests = visits.filter((v) => v.status === 'active');
+
+    // Total guests today (any status, by date)
+    const totalGuestsToday = visits.filter((v) => {
+      if (v.dayOfWeek) {
+        return v.dayOfWeek === todayName;
+      }
+      const ts = v.createdAt || v.startTime;
+      if (ts && typeof ts.toDate === 'function') {
+        const dt = ts.toDate();
+        return dt.toDateString() === now.toDateString();
+      }
+      return false;
+    }).length;
+
+    const stats = {
+      activeGuests: activeGuests.length,
+      totalGuestsToday,
+    };
+
+    // Weekly traffic: group by day of week from createdAt (all-time for now)
+    const weeklyCounts = {
+      0: 0, // Sun
+      1: 0, // Mon
+      2: 0, // Tue
+      3: 0, // Wed
+      4: 0, // Thu
+      5: 0, // Fri
+      6: 0, // Sat
+    };
+
+    visits.forEach((v) => {
+      const ts = v.createdAt || v.startTime;
+      if (!ts || typeof ts.toDate !== 'function') return;
+      const dt = ts.toDate();
+      const dayIndex = dt.getDay(); // 0 = Sunday
+      weeklyCounts[dayIndex] = (weeklyCounts[dayIndex] || 0) + 1;
+    });
+
+    const shortDayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const order = [1, 2, 3, 4, 5, 6, 0]; // Mon..Sun
+
+    const weeklyTraffic = order.map((idx) => ({
+      day: shortDayLabels[idx],
+      value: weeklyCounts[idx] || 0,
+    }));
+
+    // Auto-accept flag (for toggle in UI). Default true to keep auto on.
+    let autoAcceptGuests = true;
+    try {
+      const locSnap = await locationsCol
+        .where('owner', '==', partnerId)
+        .limit(1)
+        .get();
+
+      if (!locSnap.empty) {
+        const locData = locSnap.docs[0].data() || {};
+        if (typeof locData.autoAcceptGuests === 'boolean') {
+          autoAcceptGuests = locData.autoAcceptGuests;
+        }
+      }
+    } catch (err) {
+      console.error('Error reading autoAcceptGuests in /partner/analytics:', err);
+    }
 
     return res.json({
-      summary: {
-        totalVisits,
-        activeVisits,
-        completedVisits,
-        expiredVisits,
-        totalRevenue: totalRevenueDollars,
-      },
+      stats,
+      requestedGuests,
+      activeGuests,
+      weeklyTraffic,
+      autoAcceptGuests,
     });
   } catch (err) {
     console.error('GET /partner/analytics error:', err);
@@ -319,7 +408,7 @@ partnerRouter.post('/guests/:visitId/accept', protect, async (req, res) => {
       });
     }
 
-    if (visit.status !== 'pending') {
+    if (visit.status !== 'pending' && visit.status !== 'requested') {
       return res.status(400).json({ error: 'Visit is not pending' });
     }
 
