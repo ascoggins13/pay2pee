@@ -1,18 +1,108 @@
 // routes/partnerRoutes.js
-const express = require('express');
-const { body, validationResult } = require('express-validator');
-const axios = require('axios');
+const express = require("express");
+const { body, validationResult } = require("express-validator");
+const axios = require("axios");
 
-const protect = require('../middleware/protect');
-const { admin, firestore } = require('../firebase-admin');
-const stripeService = require('../services/stripeService');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const protect = require("../middleware/protect");
+const { admin, firestore } = require("../firebase-admin");
+const stripeService = require("../services/stripeService");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
-const usersCol = firestore.collection('users');
-const partnersCol = firestore.collection('partners');
-const locationsCol = firestore.collection('locations');
-const guestVisitsCol = firestore.collection('guestVisits');
+const usersCol = firestore.collection("users");
+const partnersCol = firestore.collection("partners");
+const locationsCol = firestore.collection("locations");
+const guestVisitsCol = firestore.collection("guestVisits");
 const FieldValue = admin.firestore.FieldValue;
+
+// ------------------------------
+// Queue + Grace Period Helpers
+// ------------------------------
+const GRACE_SECONDS = 180;
+
+function toMillis(ts) {
+  if (!ts) return null;
+  if (typeof ts === "number") return ts;
+  if (typeof ts === "string") {
+    const d = new Date(ts);
+    const ms = d.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof ts?.toMillis === "function") return ts.toMillis();
+  if (ts?._seconds) return ts._seconds * 1000;
+  return null;
+}
+
+function secondsRemaining(futureTs) {
+  const ms = toMillis(futureTs);
+  if (!ms) return null;
+  return Math.max(0, Math.floor((ms - Date.now()) / 1000));
+}
+
+async function maybePromoteNextVisit(locationId) {
+  if (!locationId) return null;
+
+  const locationRef = locationsCol.doc(locationId);
+  const locationSnap = await locationRef.get();
+  if (!locationSnap.exists) return null;
+
+  const location = locationSnap.data() || {};
+  if (!location.autoAcceptGuests) return null;
+
+  // Grace window blocks promotion
+  const graceUntilMs = toMillis(location.graceUntil);
+  if (graceUntilMs && graceUntilMs > Date.now()) return null;
+
+  // If there's already an active visit, don't promote
+  const activeSnap = await guestVisitsCol
+    .where("locationId", "==", locationId)
+    .where("status", "==", "active")
+    .limit(1)
+    .get();
+
+  if (!activeSnap.empty) return null;
+
+  // ✅ Promote the oldest REQUESTED visit (your system uses requested/active)
+  const pendingSnap = await guestVisitsCol
+    .where("locationId", "==", locationId)
+    .where("status", "==", "requested")
+    .orderBy("createdAt", "asc")
+    .limit(1)
+    .get();
+
+  if (pendingSnap.empty) return null;
+
+  const doc = pendingSnap.docs[0];
+  const visit = doc.data() || {};
+
+  const maxDurationMinutes = Number(visit.maxDurationMinutes || 8);
+  const now = admin.firestore.Timestamp.now();
+  const expiresAt = admin.firestore.Timestamp.fromMillis(
+    now.toMillis() + maxDurationMinutes * 60 * 1000
+  );
+
+  // ✅ When we auto-activate, also set accessCode/instructions (needed for MyPass)
+  await doc.ref.set(
+    {
+      status: "active",
+      startTime: now,
+      expiresAt,
+      accessCode: location.accessCode || null,
+      instructions: location.instructions || null,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return {
+    id: doc.id,
+    ...visit,
+    status: "active",
+    startTime: now,
+    expiresAt,
+    accessCode: location.accessCode || null,
+    instructions: location.instructions || null,
+  };
+}
 
 // Helper: geocode an address -> { lat, lng } or null
 async function geocodeAddress(address) {
@@ -20,31 +110,24 @@ async function geocodeAddress(address) {
   if (!apiKey || !address) return null;
 
   try {
-    const res = await axios.get(
-      'https://maps.googleapis.com/maps/api/geocode/json',
-      {
-        params: { address, key: apiKey },
-      }
-    );
+    const res = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
+      params: { address, key: apiKey },
+    });
 
     if (
       !res.data ||
-      res.data.status !== 'OK' ||
+      res.data.status !== "OK" ||
       !Array.isArray(res.data.results) ||
       res.data.results.length === 0
     ) {
-      console.warn(
-        'Geocoding failed:',
-        res.data?.status,
-        res.data?.error_message
-      );
+      console.warn("Geocoding failed:", res.data?.status, res.data?.error_message);
       return null;
     }
 
     const loc = res.data.results[0].geometry.location;
     return { lat: loc.lat, lng: loc.lng };
   } catch (err) {
-    console.error('Geocoding error:', err);
+    console.error("Geocoding error:", err);
     return null;
   }
 }
@@ -56,24 +139,15 @@ const partnerRouter = express.Router();
 
 /**
  * GET /api/partner/summary
- *
- * Returns the partner's dashboard summary used by PartnerHomeScreen:
- * - partnerId, email, name
- * - address, isActive
- * - todayVisits, currentBalance, lastPayoutDate
- * - rating, reviews
- * - locationDetails (price, accessCode, hours, description, features, photos)
- * - ownerName, avatarUrl
- * - stripeAccountId, stripeStatus
  */
-partnerRouter.get('/summary', protect, async (req, res) => {
+partnerRouter.get("/summary", protect, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
 
     const [userDoc, partnerDoc, locSnap] = await Promise.all([
       usersCol.doc(userId).get(),
       partnersCol.doc(userId).get(),
-      locationsCol.where('owner', '==', userId).limit(1).get(),
+      locationsCol.where("owner", "==", userId).limit(1).get(),
     ]);
 
     const user = userDoc.exists ? userDoc.data() : {};
@@ -84,12 +158,12 @@ partnerRouter.get('/summary', protect, async (req, res) => {
     const loc = hasLocation ? locDoc.data() : {};
     const locId = hasLocation ? locDoc.id : null;
 
-    // 🔹 Refresh Stripe status live if we have a Stripe account ID
+    // Refresh Stripe status live
     let stripeStatus = partner.stripeStatus || {};
     if (
       partner.stripeAccountId &&
       stripeService &&
-      typeof stripeService.getAccount === 'function'
+      typeof stripeService.getAccount === "function"
     ) {
       try {
         const acct = await stripeService.getAccount(partner.stripeAccountId);
@@ -99,25 +173,21 @@ partnerRouter.get('/summary', protect, async (req, res) => {
           details_submitted: !!acct.details_submitted,
         };
 
-        // Persist latest status in Firestore
         await partnersCol.doc(userId).set(
           {
             stripeStatus,
-            onboardingStatus: acct.details_submitted
-              ? 'verified'
-              : 'pending_verification',
+            onboardingStatus: acct.details_submitted ? "verified" : "pending_verification",
             updatedAt: new Date().toISOString(),
           },
           { merge: true }
         );
       } catch (err) {
-        console.error('Error refreshing Stripe account status:', err);
-        // fall back to whatever was stored
+        console.error("Error refreshing Stripe account status:", err);
         stripeStatus = partner.stripeStatus || {};
       }
     }
 
-    // 🔹 Fetch Stripe balance (available vs pending) for this partner
+    // Fetch Stripe balance
     let stripeBalanceTotal = null;
     let stripeAvailable = null;
     let stripePending = null;
@@ -131,46 +201,27 @@ partnerRouter.get('/summary', protect, async (req, res) => {
         const avail = Array.isArray(bal.available) ? bal.available[0] : null;
         const pend = Array.isArray(bal.pending) ? bal.pending[0] : null;
 
-        stripeAvailable = avail ? avail.amount / 100 : 0; // dollars
-        stripePending = pend ? pend.amount / 100 : 0; // dollars
+        stripeAvailable = avail ? avail.amount / 100 : 0;
+        stripePending = pend ? pend.amount / 100 : 0;
         stripeBalanceTotal = (stripeAvailable || 0) + (stripePending || 0);
       } catch (err) {
-        console.error(
-          'Error fetching Stripe balance in /partner/summary:',
-          err
-        );
+        console.error("Error fetching Stripe balance in /partner/summary:", err);
       }
     }
 
-    // Fallback to old behavior if Stripe balance not available
     const totalBalance =
-      stripeBalanceTotal !== null
-        ? stripeBalanceTotal
-        : Number(partner.pendingPayout || 0);
+      stripeBalanceTotal !== null ? stripeBalanceTotal : Number(partner.pendingPayout || 0);
 
-    const availableBalance =
-      stripeAvailable !== null ? stripeAvailable : totalBalance;
+    const availableBalance = stripeAvailable !== null ? stripeAvailable : totalBalance;
+    const pendingBalance = stripePending !== null ? stripePending : null;
 
-    const pendingBalance =
-      stripePending !== null ? stripePending : null;
-
-    // 🔹 Compute today's guests from guestVisits (for PartnerHomeScreen)
+    // Compute today's guests from guestVisits
     let todayCount = 0;
     if (locId) {
       try {
-        const visitsSnap = await guestVisitsCol
-          .where('locationId', '==', locId)
-          .get();
+        const visitsSnap = await guestVisitsCol.where("locationId", "==", locId).get();
 
-        const dayNames = [
-          'Sunday',
-          'Monday',
-          'Tuesday',
-          'Wednesday',
-          'Thursday',
-          'Friday',
-          'Saturday',
-        ];
+        const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
         const now = new Date();
         const todayName = dayNames[now.getDay()];
 
@@ -180,14 +231,14 @@ partnerRouter.get('/summary', protect, async (req, res) => {
           let visitDay = v.dayOfWeek;
           if (!visitDay) {
             const ts = v.createdAt || v.startTime;
-            if (ts && typeof ts.toDate === 'function') {
+            if (ts && typeof ts.toDate === "function") {
               visitDay = dayNames[ts.toDate().getDay()];
             }
           }
           return visitDay === todayName;
         }).length;
       } catch (err) {
-        console.error('Error computing todayVisits in /partner/summary:', err);
+        console.error("Error computing todayVisits in /partner/summary:", err);
         todayCount = 0;
       }
     }
@@ -196,17 +247,13 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       partnerId: userId,
       email: user.email || partner.email || null,
 
-      name: loc.name || partner.businessName || 'Your Bathroom Name',
+      name: loc.name || partner.businessName || "Your Bathroom Name",
       address:
-        loc.address ||
-        partner.businessAddress ||
-        'Add your address so guests can find you.',
+        loc.address || partner.businessAddress || "Add your address so guests can find you.",
       isActive: loc.isActive !== false,
 
-      // 🔹 Use computed todayVisits + Stripe balances
       todayVisits: todayCount,
 
-      // balances (Stripe-backed where available)
       currentBalance: totalBalance,
       availableBalance,
       pendingBalance,
@@ -222,9 +269,9 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
       locationDetails: {
         price: Number(loc.price || loc.pricing?.basePrice || 0),
-        accessCode: loc.accessCode || '',
-        hours: loc.hours || '—',
-        description: loc.description || '',
+        accessCode: loc.accessCode || "",
+        hours: loc.hours || "—",
+        description: loc.description || "",
         features: Array.isArray(loc.amenities) ? loc.amenities : [],
         photos: Array.isArray(loc.photos) ? loc.photos : [],
       },
@@ -232,8 +279,8 @@ partnerRouter.get('/summary', protect, async (req, res) => {
       ownerName:
         partner.ownerName ||
         user.name ||
-        (user.email ? user.email.split('@')[0] : 'Partner'),
-      avatarUrl: partner.avatarUrl || user.avatarUrl || '',
+        (user.email ? user.email.split("@")[0] : "Partner"),
+      avatarUrl: partner.avatarUrl || user.avatarUrl || "",
 
       stripeAccountId: partner.stripeAccountId || null,
       stripeStatus: {
@@ -245,32 +292,22 @@ partnerRouter.get('/summary', protect, async (req, res) => {
 
     return res.json(data);
   } catch (err) {
-    console.error('GET /partner/summary error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error("GET /partner/summary error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
 /**
  * GET /api/partner/analytics
- *
- * Returns analytics in the exact shape expected by PartnerAnalytics.js:
- * - stats: { activeGuests, totalGuestsToday }
- * - requestedGuests: today's requested visits
- * - activeGuests: all active visits
- * - weeklyTraffic: [{ day: 'Mon', value: N }, ...]
- * - autoAcceptGuests: boolean (from location, defaults true)
  */
-partnerRouter.get('/analytics', protect, async (req, res) => {
+partnerRouter.get("/analytics", protect, async (req, res) => {
   try {
     const partnerId = req.user.userId || req.user.id;
     if (!partnerId) {
-      return res.status(400).json({ error: 'Missing partner id' });
+      return res.status(400).json({ error: "Missing partner id" });
     }
 
-    // Load all visits for this partner (guestVisits.partnerId set in payments flow)
-    const visitsSnap = await guestVisitsCol
-      .where('partnerId', '==', partnerId)
-      .get();
+    const visitsSnap = await guestVisitsCol.where("partnerId", "==", partnerId).get();
 
     const visits = visitsSnap.docs.map((d) => ({
       id: d.id,
@@ -278,44 +315,77 @@ partnerRouter.get('/analytics', protect, async (req, res) => {
     }));
 
     const now = new Date();
-    const dayNames = [
-      'Sunday',
-      'Monday',
-      'Tuesday',
-      'Wednesday',
-      'Thursday',
-      'Friday',
-      'Saturday',
-    ];
+
+    // Resolve primary location + compute grace seconds
+    let primaryLocationId = null;
+    let graceSecondsRemaining = null;
+    let autoAcceptGuests = true;
+
+    try {
+      const locSnap = await locationsCol.where("owner", "==", partnerId).limit(1).get();
+      if (!locSnap.empty) {
+        const locDoc = locSnap.docs[0];
+        primaryLocationId = locDoc.id;
+
+        const locData = locDoc.data() || {};
+        if (typeof locData.autoAcceptGuests === "boolean") {
+          autoAcceptGuests = locData.autoAcceptGuests;
+        }
+
+        // ✅ compute grace seconds remaining
+        if (locData.graceUntil) {
+          graceSecondsRemaining = secondsRemaining(locData.graceUntil);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // ✅ If grace ended and auto-accept is on, promote the next queued guest
+    if (primaryLocationId) {
+      await maybePromoteNextVisit(primaryLocationId);
+
+      // refresh graceSecondsRemaining after possible promotion
+      try {
+        const freshLoc = await locationsCol.doc(primaryLocationId).get();
+        const freshData = freshLoc.exists ? freshLoc.data() : null;
+        if (freshData?.graceUntil) {
+          graceSecondsRemaining = secondsRemaining(freshData.graceUntil);
+        } else {
+          graceSecondsRemaining = null;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     const todayName = dayNames[now.getDay()];
 
-    // Requested guests for *today* (used for the "Requested" list)
+    // ✅ Requested guests (your system uses requested; keep backward-compat with pending)
     const requestedGuests = visits.filter((v) => {
-      if (v.status !== 'requested') return false;
+      if (!["requested", "pending"].includes(v.status)) return false;
 
-      // Prefer dayOfWeek if present
-      if (v.dayOfWeek) {
-        return v.dayOfWeek === todayName;
-      }
+      if (v.dayOfWeek) return v.dayOfWeek === todayName;
 
       const ts = v.createdAt || v.startTime;
-      if (ts && typeof ts.toDate === 'function') {
+      if (ts && typeof ts.toDate === "function") {
         const dt = ts.toDate();
         return dt.toDateString() === now.toDateString();
       }
       return false;
     });
 
-    // All active guests (used for "Currently in your bathroom")
-    const activeGuests = visits.filter((v) => v.status === 'active');
+    requestedGuests.sort(
+      (a, b) => (toMillis(a.createdAt) || 0) - (toMillis(b.createdAt) || 0)
+    );
 
-    // Total guests today (any status, by date)
+    const activeGuests = visits.filter((v) => v.status === "active");
+
     const totalGuestsToday = visits.filter((v) => {
-      if (v.dayOfWeek) {
-        return v.dayOfWeek === todayName;
-      }
+      if (v.dayOfWeek) return v.dayOfWeek === todayName;
       const ts = v.createdAt || v.startTime;
-      if (ts && typeof ts.toDate === 'function') {
+      if (ts && typeof ts.toDate === "function") {
         const dt = ts.toDate();
         return dt.toDateString() === now.toDateString();
       }
@@ -327,26 +397,17 @@ partnerRouter.get('/analytics', protect, async (req, res) => {
       totalGuestsToday,
     };
 
-    // Weekly traffic: group by day of week from createdAt (all-time for now)
-    const weeklyCounts = {
-      0: 0, // Sun
-      1: 0, // Mon
-      2: 0, // Tue
-      3: 0, // Wed
-      4: 0, // Thu
-      5: 0, // Fri
-      6: 0, // Sat
-    };
+    // Weekly traffic
+    const weeklyCounts = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
 
     visits.forEach((v) => {
       const ts = v.createdAt || v.startTime;
-      if (!ts || typeof ts.toDate !== 'function') return;
+      if (!ts || typeof ts.toDate !== "function") return;
       const dt = ts.toDate();
-      const dayIndex = dt.getDay(); // 0 = Sunday
-      weeklyCounts[dayIndex] = (weeklyCounts[dayIndex] || 0) + 1;
+      weeklyCounts[dt.getDay()] = (weeklyCounts[dt.getDay()] || 0) + 1;
     });
 
-    const shortDayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const shortDayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const order = [1, 2, 3, 4, 5, 6, 0]; // Mon..Sun
 
     const weeklyTraffic = order.map((idx) => ({
@@ -354,42 +415,24 @@ partnerRouter.get('/analytics', protect, async (req, res) => {
       value: weeklyCounts[idx] || 0,
     }));
 
-    // Auto-accept flag (for toggle in UI). Default true to keep auto on.
-    let autoAcceptGuests = true;
-    try {
-      const locSnap = await locationsCol
-        .where('owner', '==', partnerId)
-        .limit(1)
-        .get();
-
-      if (!locSnap.empty) {
-        const locData = locSnap.docs[0].data() || {};
-        if (typeof locData.autoAcceptGuests === 'boolean') {
-          autoAcceptGuests = locData.autoAcceptGuests;
-        }
-      }
-    } catch (err) {
-      console.error('Error reading autoAcceptGuests in /partner/analytics:', err);
-    }
-
     return res.json({
       stats,
       requestedGuests,
       activeGuests,
       weeklyTraffic,
       autoAcceptGuests,
+      graceSecondsRemaining, // ✅ now defined + returned
     });
   } catch (err) {
-    console.error('GET /partner/analytics error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error("GET /partner/analytics error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
 /**
  * POST /api/partner/guests/:visitId/accept
- * Host/partner accepts a pending guest visit (status -> active).
  */
-partnerRouter.post('/guests/:visitId/accept', protect, async (req, res) => {
+partnerRouter.post("/guests/:visitId/accept", protect, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
     const { visitId } = req.params;
@@ -398,42 +441,81 @@ partnerRouter.post('/guests/:visitId/accept', protect, async (req, res) => {
     const visitSnap = await visitRef.get();
 
     if (!visitSnap.exists) {
-      return res.status(404).json({ error: 'Visit not found' });
+      return res.status(404).json({ error: "Visit not found" });
     }
 
     const visit = visitSnap.data() || {};
     if (visit.partnerId !== userId) {
-      return res.status(403).json({
-        error: 'You are not allowed to manage this visit',
+      return res.status(403).json({ error: "You are not allowed to manage this visit" });
+    }
+
+    // ✅ accept supports requested (and pending for backward-compat)
+    if (visit.status !== "requested" && visit.status !== "pending") {
+      return res.status(400).json({ error: "Visit is not pending" });
+    }
+
+    const locationId = visit.locationId;
+    if (!locationId) {
+      return res.status(400).json({ error: "Visit is missing a locationId" });
+    }
+
+    const locRef = locationsCol.doc(locationId);
+    const locSnap = await locRef.get();
+    if (!locSnap.exists) {
+      return res.status(404).json({ error: "Location not found" });
+    }
+
+    const graceUntilMs = toMillis(locSnap.data()?.graceUntil);
+    if (graceUntilMs && Date.now() < graceUntilMs) {
+      const diff = Math.ceil((graceUntilMs - Date.now()) / 1000);
+      return res.status(409).json({
+        error: "Location is in grace period",
+        graceSecondsRemaining: diff > 0 ? diff : 0,
       });
     }
 
-    if (visit.status !== 'pending' && visit.status !== 'requested') {
-      return res.status(400).json({ error: 'Visit is not pending' });
+    const activeSnap = await guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("status", "==", "active")
+      .limit(1)
+      .get();
+
+    if (!activeSnap.empty) {
+      return res.status(409).json({ error: "A guest is already active for this location" });
     }
 
-    const now = FieldValue.serverTimestamp();
+    const nowTs = admin.firestore.Timestamp.now();
+    const maxDurationMinutes = Number(visit.maxDurationMinutes || 8);
+    const expiresAt = admin.firestore.Timestamp.fromMillis(
+      nowTs.toMillis() + maxDurationMinutes * 60 * 1000
+    );
+
+    const locData = locSnap.data() || {};
 
     await visitRef.set(
       {
-        status: 'active',
-        updatedAt: now,
+        status: "active",
+        startTime: nowTs,
+        expiresAt,
+        accessCode: locData.accessCode || visit.accessCode || null,
+        instructions: locData.instructions || visit.instructions || null,
+        updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    return res.json({ id: visitId, status: 'active' });
+    return res.json({ id: visitId, status: "active" });
   } catch (err) {
-    console.error('POST /partner/guests/:visitId/accept error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error("POST /partner/guests/:visitId/accept error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
 /**
  * POST /api/partner/guests/:visitId/end
- * Host/partner ends an active guest visit (status -> completed).
+ * Starts grace period.
  */
-partnerRouter.post('/guests/:visitId/end', protect, async (req, res) => {
+partnerRouter.post("/guests/:visitId/end", protect, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
     const { visitId } = req.params;
@@ -442,89 +524,85 @@ partnerRouter.post('/guests/:visitId/end', protect, async (req, res) => {
     const visitSnap = await visitRef.get();
 
     if (!visitSnap.exists) {
-      return res.status(404).json({ error: 'Visit not found' });
+      return res.status(404).json({ error: "Visit not found" });
     }
 
     const visit = visitSnap.data() || {};
     const locationId = visit.locationId;
 
     if (!locationId) {
-      return res.status(400).json({ error: 'Visit is missing a locationId' });
+      return res.status(400).json({ error: "Visit is missing a locationId" });
     }
 
     const locRef = locationsCol.doc(locationId);
     const locSnap = await locRef.get();
 
     if (!locSnap.exists) {
-      return res.status(404).json({ error: 'Location not found' });
+      return res.status(404).json({ error: "Location not found" });
     }
 
     const locData = locSnap.data() || {};
     if (locData.owner !== userId) {
-      return res.status(403).json({
-        error: 'You are not allowed to manage visits for this location',
-      });
+      return res.status(403).json({ error: "You are not allowed to manage visits for this location" });
     }
 
-    if (visit.status !== 'active') {
-      return res.status(400).json({ error: 'Visit is not currently active' });
+    if (visit.status !== "active") {
+      return res.status(400).json({ error: "Visit is not currently active" });
     }
 
-    const now = FieldValue.serverTimestamp();
+    const nowTs = admin.firestore.Timestamp.now();
+    const graceUntil = admin.firestore.Timestamp.fromMillis(
+      nowTs.toMillis() + GRACE_SECONDS * 1000
+    );
 
     await visitRef.set(
       {
-        status: 'completed',
-        endTime: now,
-        updatedAt: now,
+        status: "completed",
+        endTime: nowTs,
+        updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    return res.json({ id: visitId, status: 'completed' });
+    await locRef.set(
+      {
+        graceUntil,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({ id: visitId, status: "completed", graceSecondsRemaining: GRACE_SECONDS });
   } catch (err) {
-    console.error('POST /partner/guests/:visitId/end error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    console.error("POST /partner/guests/:visitId/end error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
 /**
  * PUT /api/partner/location
- * Creates/updates this partner's primary bathroom listing (used on PartnerHomeScreen).
  */
 partnerRouter.put(
-  '/location',
+  "/location",
   protect,
   [
-    body('name').optional().isString(),
-    body('address').optional().isString(),
-    body('accessCode').optional().isString(),
-    body('price').optional().isFloat({ min: 0 }),
-    body('description').optional().isString(),
-    body('features').optional().isArray(),
-    body('photos').optional().isArray(),
+    body("name").optional().isString(),
+    body("address").optional().isString(),
+    body("accessCode").optional().isString(),
+    body("price").optional().isFloat({ min: 0 }),
+    body("description").optional().isString(),
+    body("features").optional().isArray(),
+    body("photos").optional().isArray(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty())
-      return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     try {
       const userId = req.user.userId || req.user.id;
-      const {
-        name,
-        address,
-        accessCode,
-        price = 0,
-        description = '',
-        features = [],
-        photos = [],
-      } = req.body;
+      const { name, address, accessCode, price = 0, description = "", features = [], photos = [] } = req.body;
 
-      const snap = await locationsCol
-        .where('owner', '==', userId)
-        .limit(1)
-        .get();
+      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
 
       let locRef;
       let existing = {};
@@ -536,9 +614,9 @@ partnerRouter.put(
       }
 
       const addressChanged =
-        typeof address === 'string' &&
+        typeof address === "string" &&
         address.trim() &&
-        address.trim() !== (existing.address || '').trim();
+        address.trim() !== (existing.address || "").trim();
 
       let coordinates = existing.coordinates || null;
 
@@ -553,8 +631,7 @@ partnerRouter.put(
         owner: userId,
         name: name !== undefined ? name : existing.name,
         address: address !== undefined ? address : existing.address,
-        accessCode:
-          accessCode !== undefined ? accessCode : existing.accessCode || '',
+        accessCode: accessCode !== undefined ? accessCode : existing.accessCode || "",
         price: Number(price),
         description,
         amenities: Array.isArray(features) ? features : [],
@@ -568,63 +645,44 @@ partnerRouter.put(
       const updatedSnap = await locRef.get();
       const loc = updatedSnap.data() || {};
 
-      return res.json({
-        id: locRef.id,
-        location: loc,
-      });
+      return res.json({ id: locRef.id, location: loc });
     } catch (err) {
-      console.error('PUT /partner/location error:', err);
-      return res.status(500).json({ error: 'Server error' });
+      console.error("PUT /partner/location error:", err);
+      return res.status(500).json({ error: "Server error" });
     }
   }
 );
 
 /**
  * POST /api/partner/onboard-link
- * Ensures a Stripe Connect account exists, then returns a hosted
- * onboarding link URL so the partner can finish setup in Stripe.
  */
-partnerRouter.post('/onboard-link', protect, async (req, res) => {
+partnerRouter.post("/onboard-link", protect, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
 
-    // get email from body or users collection
     let email = req.body.email;
     if (!email) {
       const userDoc = await usersCol.doc(userId).get();
       email = userDoc.exists ? userDoc.data().email : null;
     }
-    if (!email) {
-      return res.status(400).json({ error: 'Email required' });
-    }
+    if (!email) return res.status(400).json({ error: "Email required" });
 
-    // load partner doc
     const partnerRef = partnersCol.doc(userId);
     const partnerSnap = await partnerRef.get();
     const partnerData = partnerSnap.exists ? partnerSnap.data() : {};
     let { stripeAccountId } = partnerData;
 
-    // 1) If no Stripe account yet, create one
     if (!stripeAccountId) {
-      const account = await stripeService.createPartnerAccount(
-        userId,
-        email,
-        req.body || {}
-      );
+      const account = await stripeService.createPartnerAccount(userId, email, req.body || {});
       stripeAccountId = account.id;
       await partnerRef.set(
-        {
-          stripeAccountId,
-          onboardingStatus: 'pending_verification',
-        },
+        { stripeAccountId, onboardingStatus: "pending_verification" },
         { merge: true }
       );
     }
 
-    const FRONTEND_URL =
-      process.env.FRONTEND_URL || 'https://pay2pee.app';
+    const FRONTEND_URL = process.env.FRONTEND_URL || "https://pay2pee.app";
 
-    // 2) Create the hosted onboarding link
     const returnUrl = `${FRONTEND_URL}/partner`;
     const refreshUrl = `${FRONTEND_URL}/partner`;
 
@@ -636,10 +694,8 @@ partnerRouter.post('/onboard-link', protect, async (req, res) => {
 
     return res.json({ url: link.url, frontendUrl: FRONTEND_URL });
   } catch (err) {
-    console.error('POST /partner/onboard-link error:', err);
-    return res
-      .status(500)
-      .json({ error: err.message || 'Stripe onboarding link error' });
+    console.error("POST /partner/onboard-link error:", err);
+    return res.status(500).json({ error: err.message || "Stripe onboarding link error" });
   }
 });
 
@@ -650,64 +706,46 @@ const hostRouter = express.Router();
 
 /**
  * PUT /api/host/visibility
- * Toggles whether this host's location is active/visible to guests.
  */
 hostRouter.put(
-  '/visibility',
+  "/visibility",
   protect,
-  [body('isActive').isBoolean()],
+  [body("isActive").isBoolean()],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty())
-      return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     try {
       const userId = req.user.userId || req.user.id;
       const { isActive } = req.body;
 
-      const snap = await locationsCol
-        .where('owner', '==', userId)
-        .limit(1)
-        .get();
-
-      if (snap.empty) {
-        return res.status(404).json({ error: 'Location not found' });
-      }
+      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+      if (snap.empty) return res.status(404).json({ error: "Location not found" });
 
       const locRef = snap.docs[0].ref;
-      await locRef.set(
-        {
-          isActive,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await locRef.set({ isActive, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
 
       return res.json({ success: true, isActive });
     } catch (err) {
-      console.error('PUT /host/visibility error:', err);
-      return res.status(500).json({ error: 'Server error' });
+      console.error("PUT /host/visibility error:", err);
+      return res.status(500).json({ error: "Server error" });
     }
   }
 );
 
 /**
  * PUT /api/host/auto-accept
- * Updates autoAcceptGuests flag for a given location.
  */
 hostRouter.put(
-  '/auto-accept',
+  "/auto-accept",
   protect,
   [
-    body('locationId').notEmpty().withMessage('locationId is required'),
-    body('autoAcceptGuests')
-      .isBoolean()
-      .withMessage('autoAcceptGuests must be true or false'),
+    body("locationId").notEmpty().withMessage("locationId is required"),
+    body("autoAcceptGuests").isBoolean().withMessage("autoAcceptGuests must be true or false"),
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty())
-      return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     try {
       const userId = req.user.userId || req.user.id;
@@ -715,55 +753,41 @@ hostRouter.put(
 
       const ref = locationsCol.doc(locationId);
       const snap = await ref.get();
-
-      if (!snap.exists) {
-        return res.status(404).json({ error: 'Location not found' });
-      }
+      if (!snap.exists) return res.status(404).json({ error: "Location not found" });
 
       const loc = snap.data() || {};
-
       if (loc.owner !== userId) {
-        return res.status(403).json({
-          error: 'You are not allowed to update this location',
-        });
+        return res.status(403).json({ error: "You are not allowed to update this location" });
       }
 
       await ref.set({ autoAcceptGuests }, { merge: true });
 
       const updated = await ref.get();
       const updatedLoc = updated.data() || {};
-      return res.json({
-        id: ref.id,
-        autoAcceptGuests: !!updatedLoc.autoAcceptGuests,
-      });
+      return res.json({ id: ref.id, autoAcceptGuests: !!updatedLoc.autoAcceptGuests });
     } catch (err) {
-      console.error('PUT /host/auto-accept error:', err);
-      return res.status(500).json({ error: 'Server error' });
+      console.error("PUT /host/auto-accept error:", err);
+      return res.status(500).json({ error: "Server error" });
     }
   }
 );
 
 /**
  * POST /api/host/payout
- * Manual payout request for partner.
  */
 hostRouter.post(
-  '/payout',
+  "/payout",
   protect,
-  [body('amountRequested').isFloat({ min: 5 })],
+  [body("amountRequested").isFloat({ min: 5 })],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty())
-      return res.status(400).json({ errors: errors.array() });
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     try {
       const partnerId = req.user.userId || req.user.id;
       const amount = Number(req.body.amountRequested);
 
-      const transfer = await stripeService.initiateManualPayout(
-        partnerId,
-        amount
-      );
+      const transfer = await stripeService.initiateManualPayout(partnerId, amount);
 
       const doc = await partnersCol.doc(partnerId).get();
       const pdata = doc.exists ? doc.data() : {};
@@ -775,8 +799,8 @@ hostRouter.post(
         lastPayoutDate: pdata.lastPayoutDate || new Date().toISOString(),
       });
     } catch (err) {
-      console.error('POST /host/payout error:', err);
-      return res.status(500).json({ error: err.message || 'Stripe error' });
+      console.error("POST /host/payout error:", err);
+      return res.status(500).json({ error: err.message || "Stripe error" });
     }
   }
 );
