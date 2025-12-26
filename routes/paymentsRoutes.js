@@ -11,11 +11,11 @@ const router = express.Router();
 
 const guestVisitsCol = firestore.collection("guestVisits");
 const locationsCol = firestore.collection("locations");
+const partnersCol = firestore.collection("partners");
 
 // ------------------------------
 // Queue + Grace Period Helpers
 // ------------------------------
-// 3 minute cleanup window between guests
 const GRACE_SECONDS = 180;
 
 function toMillis(ts) {
@@ -43,85 +43,93 @@ async function computeGrace(locationId) {
   return { graceUntil, graceSecondsRemaining: remaining };
 }
 
-async function setGraceWindow(locationId) {
+async function setGraceWindow(locationId, tx) {
   if (!locationId) return null;
   const graceUntil = admin.firestore.Timestamp.fromMillis(
     Date.now() + GRACE_SECONDS * 1000
   );
-  await locationsCol.doc(locationId).set({ graceUntil }, { merge: true });
+  const ref = locationsCol.doc(locationId);
+
+  if (tx) {
+    tx.set(
+      ref,
+      { graceUntil, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+  } else {
+    await ref.set(
+      { graceUntil, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+  }
+
   return graceUntil;
 }
 
-async function hasActiveVisit(locationId) {
-  const snap = await guestVisitsCol
-    .where("locationId", "==", locationId)
-    .where("status", "==", "active")
-    .limit(1)
-    .get();
-  return !snap.empty;
-}
-
-// NOTE: paymentsRoutes should NOT “force-promote” during grace.
-// Partner side (partnerRoutes /analytics) is already responsible for promotion when grace ends.
-// This helper is kept for rare cases where you want session endpoint to opportunistically activate,
-// but we will only use it when auto-accept is ON, grace is NOT active, and no active visit exists.
-async function maybePromoteNextQueued(locationId) {
+async function maybePromoteNextQueuedTransactional(locationId) {
   if (!locationId) return null;
 
-  const locSnap = await locationsCol.doc(locationId).get();
-  if (!locSnap.exists) return null;
-  const loc = locSnap.data() || {};
+  const locRef = locationsCol.doc(locationId);
 
-  if (!loc.autoAcceptGuests) return null;
+  const promoted = await firestore.runTransaction(async (tx) => {
+    const locSnap = await tx.get(locRef);
+    if (!locSnap.exists) return null;
 
-  // Must NOT have an active guest
-  if (await hasActiveVisit(locationId)) return null;
+    const loc = locSnap.data() || {};
+    if (!loc.autoAcceptGuests) return null;
 
-  // Respect grace window
-  const graceUntilMs = toMillis(loc.graceUntil);
-  if (graceUntilMs && Date.now() < graceUntilMs) return null;
+    // lock: only one active at a time
+    if (loc.currentActiveVisitId) return null;
 
-  // Promote oldest queued guest (support both requested + pending)
-  const queuedSnap = await guestVisitsCol
-    .where("locationId", "==", locationId)
-    .where("status", "in", ["requested", "pending"])
-    .orderBy("createdAt", "asc")
-    .limit(1)
-    .get();
+    // respect grace
+    const graceUntilMs = toMillis(loc.graceUntil);
+    if (graceUntilMs && graceUntilMs > Date.now()) return null;
 
-  if (queuedSnap.empty) return null;
+    // find oldest queued (requested/pending)
+    const q = guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("status", "in", ["requested", "pending"])
+      .orderBy("createdAt", "asc")
+      .limit(1);
 
-  const doc = queuedSnap.docs[0];
-  const queued = doc.data() || {};
+    const qSnap = await tx.get(q);
+    if (qSnap.empty) return null;
 
-  const now = admin.firestore.Timestamp.now();
-  const maxMinutes = Number(queued.maxDurationMinutes || 8);
-  const expiresAt = admin.firestore.Timestamp.fromMillis(
-    Date.now() + maxMinutes * 60 * 1000
-  );
+    const doc = qSnap.docs[0];
+    const queued = doc.data() || {};
 
-  await doc.ref.set(
-    {
-      status: "active",
-      startTime: queued.startTime || now,
-      expiresAt: queued.expiresAt || expiresAt,
-      // IMPORTANT: set accessCode/instructions so MyPass can show it
-      accessCode: loc.accessCode || queued.accessCode || null,
-      instructions: loc.instructions || queued.instructions || null,
-      updatedAt: now,
-    },
-    { merge: true }
-  );
+    const now = admin.firestore.Timestamp.now();
+    const maxMinutes = Number(queued.maxDurationMinutes || 8);
+    const expiresAt = admin.firestore.Timestamp.fromMillis(
+      now.toMillis() + maxMinutes * 60 * 1000
+    );
 
-  return {
-    id: doc.id,
-    ...queued,
-    status: "active",
-    startTime: queued.startTime || now,
-    expiresAt: queued.expiresAt || expiresAt,
-    accessCode: loc.accessCode || queued.accessCode || null,
-    instructions: loc.instructions || queued.instructions || null,
-  };
+    tx.set(
+      doc.ref,
+      {
+        status: "active",
+        startTime: now,
+        expiresAt,
+        accessCode: loc.accessCode || queued.accessCode || null,
+        instructions: loc.instructions || queued.instructions || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      locRef,
+      {
+        currentActiveVisitId: doc.id,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { id: doc.id, ...queued, status: "active", startTime: now, expiresAt };
+  });
+
+  return promoted;
 }
 
 /**
@@ -215,7 +223,21 @@ router.post(
       if (!locSnap.exists) return res.status(404).json({ error: "Location not found" });
       const loc = locSnap.data() || {};
 
+      const partnerId = loc.owner || null;
+      if (!partnerId) return res.status(400).json({ error: "Location missing owner/partner" });
+
+      const partnerSnap = await partnersCol.doc(partnerId).get();
+      const partner = partnerSnap.exists ? partnerSnap.data() : {};
+      const destinationAccountId = partner.stripeAccountId || null;
+
+      if (!destinationAccountId) {
+        return res.status(400).json({
+          error: "Partner is not connected to Stripe yet. Complete onboarding first.",
+        });
+      }
+
       const unitAmount = Math.round(Number(price) * 100);
+      const applicationFeeAmount = Math.round(unitAmount * 0.30); // 30% platform fee
 
       const session = await stripe.checkout.sessions.create({
         mode: "payment",
@@ -231,7 +253,17 @@ router.post(
             quantity: 1,
           },
         ],
-        metadata: { locationId, userId },
+
+        // ✅ This is the entire Connect fix:
+        payment_intent_data: {
+          application_fee_amount: applicationFeeAmount,
+          transfer_data: {
+            destination: destinationAccountId,
+          },
+        },
+
+        metadata: { locationId, userId, partnerId, destinationAccountId },
+
         success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.CLIENT_URL}/#/home`,
       });
@@ -243,6 +275,7 @@ router.post(
     }
   }
 );
+
 
 /**
  * GET /api/payments/guest/session/:sessionId
@@ -279,19 +312,13 @@ router.get("/guest/session/:sessionId", async (req, res) => {
     const autoAcceptGuests = !!location.autoAcceptGuests;
     const partnerId = location.owner || null;
 
-    // Find existing visit for this session
-    const existingVisitSnap = await guestVisitsCol
-      .where("stripeSessionId", "==", session.id)
-      .limit(1)
-      .get();
+    // Prefer deterministic doc id (prevents double-creation races)
+    const deterministicVisitRef = guestVisitsCol.doc(session.id);
+    const deterministicSnap = await deterministicVisitRef.get();
 
-    const now = admin.firestore.Timestamp.now();
-    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const todayName = dayNames[new Date().getDay()];
-
+    // Back-compat: old systems may have random doc ids with stripeSessionId field
     let visitDoc = null;
 
-    // If visit exists, refresh status if expired
     const maybeExpireVisit = async (docId, data) => {
       if (
         data.status === "active" &&
@@ -300,17 +327,37 @@ router.get("/guest/session/:sessionId", async (req, res) => {
       ) {
         const expDate = data.expiresAt.toDate();
         if (new Date() > expDate) {
-          // End + start grace
-          await guestVisitsCol.doc(docId).set(
-            {
-              status: "expired",
-              endTime: admin.firestore.Timestamp.fromDate(expDate),
-              updatedAt: admin.firestore.Timestamp.now(),
-            },
-            { merge: true }
-          );
+          await firestore.runTransaction(async (tx) => {
+            const vRef = guestVisitsCol.doc(docId);
+            const lRef = locationsCol.doc(data.locationId);
 
-          await setGraceWindow(data.locationId);
+            const [vSnap, lSnap] = await Promise.all([tx.get(vRef), tx.get(lRef)]);
+            if (!vSnap.exists || !lSnap.exists) return;
+
+            const lData = lSnap.data() || {};
+
+            tx.set(
+              vRef,
+              {
+                status: "expired",
+                endTime: admin.firestore.Timestamp.fromDate(expDate),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+
+            // clear active lock if it points to this visit
+            if (lData.currentActiveVisitId === docId) {
+              tx.set(
+                lRef,
+                { currentActiveVisitId: null },
+                { merge: true }
+              );
+            }
+
+            // start grace
+            await setGraceWindow(data.locationId, tx);
+          });
 
           return {
             ...data,
@@ -322,20 +369,34 @@ router.get("/guest/session/:sessionId", async (req, res) => {
       return data;
     };
 
-    if (!existingVisitSnap.empty) {
-      const doc = existingVisitSnap.docs[0];
-      let data = doc.data() || {};
-      data = await maybeExpireVisit(doc.id, data);
-
-      visitDoc = { id: doc.id, ...data };
+    if (deterministicSnap.exists) {
+      let data = deterministicSnap.data() || {};
+      data = await maybeExpireVisit(deterministicSnap.id, data);
+      visitDoc = { id: deterministicSnap.id, ...data };
     } else {
-      // Create visit only if paid
+      // back-compat lookup
+      const existingVisitSnap = await guestVisitsCol
+        .where("stripeSessionId", "==", session.id)
+        .limit(1)
+        .get();
+
+      if (!existingVisitSnap.empty) {
+        const doc = existingVisitSnap.docs[0];
+        let data = doc.data() || {};
+        data = await maybeExpireVisit(doc.id, data);
+        visitDoc = { id: doc.id, ...data };
+      }
+    }
+
+    // If no visit yet, only create if paid
+    if (!visitDoc) {
       const isPaid =
         session.payment_status === "paid" ||
         session.payment_status === "no_payment_required";
 
+      const graceInfo = await computeGrace(locationId);
+
       if (!isPaid) {
-        const graceInfo = await computeGrace(locationId);
         return res.json({
           session: {
             id: session.id,
@@ -352,58 +413,68 @@ router.get("/guest/session/:sessionId", async (req, res) => {
       }
 
       const maxDurationMinutes = 8;
+      const now = admin.firestore.Timestamp.now();
 
-      const activeExists = await hasActiveVisit(locationId);
-      const graceUntilMs = toMillis(location.graceUntil);
-      const graceActive = graceUntilMs && graceUntilMs > now.toMillis();
+      // Transaction: location lock prevents race
+      await firestore.runTransaction(async (tx) => {
+        const locLive = await tx.get(locRef);
+        if (!locLive.exists) throw new Error("Location missing");
 
-      // ✅ correct: can start only if autoAccept ON, no active, no grace
-      const canStartNow = autoAcceptGuests && !activeExists && !graceActive;
+        const locData = locLive.data() || {};
+        const graceUntilMs = toMillis(locData.graceUntil);
+        const graceActive = graceUntilMs && graceUntilMs > Date.now();
 
-      // IMPORTANT: partnerRoutes uses requested/active (keep compat with pending too)
-      const visitStatus = canStartNow ? "active" : "requested";
+        const canStartNow =
+          !!locData.autoAcceptGuests &&
+          !locData.currentActiveVisitId &&
+          !graceActive;
 
-      const startTime = canStartNow ? now : null;
-      const expiresAt = canStartNow
-        ? admin.firestore.Timestamp.fromMillis(now.toMillis() + maxDurationMinutes * 60 * 1000)
-        : null;
+        const status = canStartNow ? "active" : "requested";
 
-      const visitData = {
-        stripeSessionId: session.id,
-        userId,
-        locationId,
-        partnerId,
-        status: visitStatus,
-        amountTotal: session.amount_total,
-        currency: session.currency,
+        const startTime = canStartNow ? now : null;
+        const expiresAt = canStartNow
+          ? admin.firestore.Timestamp.fromMillis(now.toMillis() + maxDurationMinutes * 60 * 1000)
+          : null;
 
-        startTime,
-        endTime: null,
-        maxDurationMinutes,
-        expiresAt,
+        const visitData = {
+          stripeSessionId: session.id,
+          userId,
+          locationId,
+          partnerId,
+          status,
+          amountTotal: session.amount_total,
+          currency: session.currency,
 
-        // if auto-activated, stamp accessCode now so MyPass shows it
-        accessCode: canStartNow ? location.accessCode || null : null,
-        instructions: canStartNow ? location.instructions || null : null,
+          startTime,
+          endTime: null,
+          maxDurationMinutes,
+          expiresAt,
 
-        dayOfWeek: todayName,
-        passType: "one-time",
+          accessCode: canStartNow ? locData.accessCode || null : null,
+          instructions: canStartNow ? locData.instructions || null : null,
 
-        createdAt: now,
-        updatedAt: now,
-      };
+          dayOfWeek: ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date().getDay()],
+          passType: "one-time",
 
-      const newRef = await guestVisitsCol.add(visitData);
-      const newSnap = await newRef.get();
-      visitDoc = { id: newRef.id, ...newSnap.data() };
+          createdAt: now,
+          updatedAt: now,
+        };
 
-      // Optional: if auto-accept is on, and conditions allow, promote next queued guest.
-      // (Mostly useful if something just ended and grace is already over.)
-      if (autoAcceptGuests) {
-        await maybePromoteNextQueued(locationId);
-      }
+        tx.set(deterministicVisitRef, visitData, { merge: true });
 
-      // Notifications (kept)
+        if (canStartNow) {
+          tx.set(
+            locRef,
+            { currentActiveVisitId: deterministicVisitRef.id },
+            { merge: true }
+          );
+        }
+      });
+
+      const createdSnap = await deterministicVisitRef.get();
+      visitDoc = { id: createdSnap.id, ...(createdSnap.data() || {}) };
+
+      // Notifications (non-transactional)
       try {
         if (userId) {
           await createNotification({
@@ -412,7 +483,7 @@ router.get("/guest/session/:sessionId", async (req, res) => {
             type: "GUEST_BOOKING_CONFIRMED",
             title: "Bathroom booked",
             body: `Your visit to ${location.name || "this bathroom"} is confirmed.`,
-            data: { guestVisitId: newRef.id, locationId },
+            data: { guestVisitId: visitDoc.id, locationId },
           });
 
           await createNotification({
@@ -421,7 +492,7 @@ router.get("/guest/session/:sessionId", async (req, res) => {
             type: "GUEST_TIME_WARNING",
             title: "Time almost up",
             body: `Your visit to ${location.name || "this bathroom"} is almost over.`,
-            data: { guestVisitId: newRef.id, locationId, expiresAt },
+            data: { guestVisitId: visitDoc.id, locationId, expiresAt: visitDoc.expiresAt || null },
           });
         }
 
@@ -432,7 +503,7 @@ router.get("/guest/session/:sessionId", async (req, res) => {
             type: "PARTNER_NEW_BOOKING",
             title: "New booking",
             body: "A guest just booked your bathroom.",
-            data: { guestVisitId: newRef.id, locationId },
+            data: { guestVisitId: visitDoc.id, locationId },
           });
         }
       } catch (notifyErr) {
@@ -466,6 +537,10 @@ router.get("/guest/session/:sessionId", async (req, res) => {
 
     const graceInfo = await computeGrace(locationId);
 
+    // Opportunistic promote (only if grace is NOT active and no active lock)
+    // This helps in edge cases where partner screen isn't open.
+    await maybePromoteNextQueuedTransactional(locationId);
+
     return res.json({
       session: {
         id: session.id,
@@ -487,7 +562,7 @@ router.get("/guest/session/:sessionId", async (req, res) => {
 
 /**
  * POST /api/payments/guest/visit/:visitId/end
- * Guest ends an active visit -> starts grace window
+ * Guest ends an active visit -> starts grace window + clears active lock
  */
 router.post("/guest/visit/:visitId/end", protect, async (req, res) => {
   const { visitId } = req.params;
@@ -496,7 +571,6 @@ router.post("/guest/visit/:visitId/end", protect, async (req, res) => {
   try {
     const visitRef = guestVisitsCol.doc(visitId);
     const snap = await visitRef.get();
-
     if (!snap.exists) return res.status(404).json({ error: "Visit not found" });
 
     const visit = snap.data() || {};
@@ -510,21 +584,36 @@ router.post("/guest/visit/:visitId/end", protect, async (req, res) => {
 
     const now = admin.firestore.Timestamp.now();
 
-    await visitRef.set(
-      {
-        status: "completed",
-        endTime: now,
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+    await firestore.runTransaction(async (tx) => {
+      const vSnap = await tx.get(visitRef);
+      if (!vSnap.exists) throw new Error("Visit missing");
+      const vData = vSnap.data() || {};
 
-    // ✅ start grace window on the location
-    if (visit.locationId) {
-      await setGraceWindow(visit.locationId);
-    }
+      const locId = vData.locationId;
+      const locRef = locId ? locationsCol.doc(locId) : null;
+      const locSnap = locRef ? await tx.get(locRef) : null;
+      const locData = locSnap?.exists ? locSnap.data() : null;
 
-    // Thank-you notification (kept)
+      tx.set(
+        visitRef,
+        {
+          status: "completed",
+          endTime: now,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (locRef && locData) {
+        // clear lock if it points to this visit
+        if (locData.currentActiveVisitId === visitId) {
+          tx.set(locRef, { currentActiveVisitId: null }, { merge: true });
+        }
+        await setGraceWindow(locId, tx);
+      }
+    });
+
+    // Thank-you notification
     try {
       await createNotification({
         userId,

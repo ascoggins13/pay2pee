@@ -14,11 +14,11 @@ const locationsCol = firestore.collection("locations");
 const guestVisitsCol = firestore.collection("guestVisits");
 const FieldValue = admin.firestore.FieldValue;
 
-// ------------------------------
-// Queue + Grace Period Helpers
-// ------------------------------
 const GRACE_SECONDS = 180;
 
+// ------------------------------
+// Helpers
+// ------------------------------
 function toMillis(ts) {
   if (!ts) return null;
   if (typeof ts === "number") return ts;
@@ -38,73 +38,81 @@ function secondsRemaining(futureTs) {
   return Math.max(0, Math.floor((ms - Date.now()) / 1000));
 }
 
-async function maybePromoteNextVisit(locationId) {
+async function promoteNextVisitTransactional(locationId) {
   if (!locationId) return null;
 
-  const locationRef = locationsCol.doc(locationId);
-  const locationSnap = await locationRef.get();
-  if (!locationSnap.exists) return null;
+  const locRef = locationsCol.doc(locationId);
 
-  const location = locationSnap.data() || {};
-  if (!location.autoAcceptGuests) return null;
+  const promoted = await firestore.runTransaction(async (tx) => {
+    const locSnap = await tx.get(locRef);
+    if (!locSnap.exists) return null;
 
-  // Grace window blocks promotion
-  const graceUntilMs = toMillis(location.graceUntil);
-  if (graceUntilMs && graceUntilMs > Date.now()) return null;
+    const loc = locSnap.data() || {};
+    if (!loc.autoAcceptGuests) return null;
 
-  // If there's already an active visit, don't promote
-  const activeSnap = await guestVisitsCol
-    .where("locationId", "==", locationId)
-    .where("status", "==", "active")
-    .limit(1)
-    .get();
+    // lock: only one active
+    if (loc.currentActiveVisitId) return null;
 
-  if (!activeSnap.empty) return null;
+    // grace blocks promotion
+    const graceUntilMs = toMillis(loc.graceUntil);
+    if (graceUntilMs && graceUntilMs > Date.now()) return null;
 
-  // ✅ Promote the oldest REQUESTED visit (your system uses requested/active)
-  const pendingSnap = await guestVisitsCol
-    .where("locationId", "==", locationId)
-    .where("status", "==", "requested")
-    .orderBy("createdAt", "asc")
-    .limit(1)
-    .get();
+    // if some older active exists but lock wasn't set, still avoid promoting
+    const activeQ = guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("status", "==", "active")
+      .limit(1);
 
-  if (pendingSnap.empty) return null;
+    const activeSnap = await tx.get(activeQ);
+    if (!activeSnap.empty) return null;
 
-  const doc = pendingSnap.docs[0];
-  const visit = doc.data() || {};
+    const queuedQ = guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("status", "in", ["requested", "pending"])
+      .orderBy("createdAt", "asc")
+      .limit(1);
 
-  const maxDurationMinutes = Number(visit.maxDurationMinutes || 8);
-  const now = admin.firestore.Timestamp.now();
-  const expiresAt = admin.firestore.Timestamp.fromMillis(
-    now.toMillis() + maxDurationMinutes * 60 * 1000
-  );
+    const queuedSnap = await tx.get(queuedQ);
+    if (queuedSnap.empty) return null;
 
-  // ✅ When we auto-activate, also set accessCode/instructions (needed for MyPass)
-  await doc.ref.set(
-    {
-      status: "active",
-      startTime: now,
-      expiresAt,
-      accessCode: location.accessCode || null,
-      instructions: location.instructions || null,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+    const doc = queuedSnap.docs[0];
+    const visit = doc.data() || {};
 
-  return {
-    id: doc.id,
-    ...visit,
-    status: "active",
-    startTime: now,
-    expiresAt,
-    accessCode: location.accessCode || null,
-    instructions: location.instructions || null,
-  };
+    const now = admin.firestore.Timestamp.now();
+    const maxMinutes = Number(visit.maxDurationMinutes || 8);
+    const expiresAt = admin.firestore.Timestamp.fromMillis(
+      now.toMillis() + maxMinutes * 60 * 1000
+    );
+
+    tx.set(
+      doc.ref,
+      {
+        status: "active",
+        startTime: now,
+        expiresAt,
+        accessCode: loc.accessCode || visit.accessCode || null,
+        instructions: loc.instructions || visit.instructions || null,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      locRef,
+      {
+        currentActiveVisitId: doc.id,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { id: doc.id, ...visit, status: "active", startTime: now, expiresAt };
+  });
+
+  return promoted;
 }
 
-// Helper: geocode an address -> { lat, lng } or null
+// Helper: geocode
 async function geocodeAddress(address) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey || !address) return null;
@@ -132,9 +140,9 @@ async function geocodeAddress(address) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
+// ------------------------------
 // Partner router -> /api/partner/*
-// ─────────────────────────────────────────────────────────────
+// ------------------------------
 const partnerRouter = express.Router();
 
 /**
@@ -187,7 +195,7 @@ partnerRouter.get("/summary", protect, async (req, res) => {
       }
     }
 
-    // Fetch Stripe balance
+    // Stripe balance
     let stripeBalanceTotal = null;
     let stripeAvailable = null;
     let stripePending = null;
@@ -215,35 +223,32 @@ partnerRouter.get("/summary", protect, async (req, res) => {
     const availableBalance = stripeAvailable !== null ? stripeAvailable : totalBalance;
     const pendingBalance = stripePending !== null ? stripePending : null;
 
-    // Compute today's guests from guestVisits
+    // Today visits count (all visits created today for this location)
     let todayCount = 0;
     if (locId) {
       try {
-        const visitsSnap = await guestVisitsCol.where("locationId", "==", locId).get();
-
-        const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
         const now = new Date();
-        const todayName = dayNames[now.getDay()];
+        const start = new Date(now);
+        start.setHours(0, 0, 0, 0);
+        const end = new Date(now);
+        end.setHours(23, 59, 59, 999);
 
-        const visits = visitsSnap.docs.map((d) => d.data());
+        const startTs = admin.firestore.Timestamp.fromDate(start);
+        const endTs = admin.firestore.Timestamp.fromDate(end);
 
-        todayCount = visits.filter((v) => {
-          let visitDay = v.dayOfWeek;
-          if (!visitDay) {
-            const ts = v.createdAt || v.startTime;
-            if (ts && typeof ts.toDate === "function") {
-              visitDay = dayNames[ts.toDate().getDay()];
-            }
-          }
-          return visitDay === todayName;
-        }).length;
+        const visitsSnap = await guestVisitsCol
+          .where("locationId", "==", locId)
+          .where("createdAt", ">=", startTs)
+          .where("createdAt", "<=", endTs)
+          .get();
+
+        todayCount = visitsSnap.size || 0;
       } catch (err) {
         console.error("Error computing todayVisits in /partner/summary:", err);
-        todayCount = 0;
       }
     }
 
-    const data = {
+    return res.json({
       partnerId: userId,
       email: user.email || partner.email || null,
 
@@ -288,9 +293,7 @@ partnerRouter.get("/summary", protect, async (req, res) => {
         payouts_enabled: !!stripeStatus.payouts_enabled,
         details_submitted: !!stripeStatus.details_submitted,
       },
-    };
-
-    return res.json(data);
+    });
   } catch (err) {
     console.error("GET /partner/summary error:", err);
     return res.status(500).json({ error: "Server error" });
@@ -299,121 +302,126 @@ partnerRouter.get("/summary", protect, async (req, res) => {
 
 /**
  * GET /api/partner/analytics
+ * Returns:
+ * { stats, requestedGuests, activeGuests, weeklyTraffic, autoAcceptGuests, graceSecondsRemaining, locationId }
+ *
+ * ✅ Fix: totalGuestsToday is now consistent (counts ALL visits created today)
  */
 partnerRouter.get("/analytics", protect, async (req, res) => {
   try {
     const partnerId = req.user.userId || req.user.id;
-    if (!partnerId) {
-      return res.status(400).json({ error: "Missing partner id" });
+    if (!partnerId) return res.status(400).json({ error: "Missing partner id" });
+
+    const locSnap = await locationsCol.where("owner", "==", partnerId).limit(1).get();
+    if (locSnap.empty) {
+      return res.json({
+        stats: { activeGuests: 0, totalGuestsToday: 0 },
+        requestedGuests: [],
+        activeGuests: [],
+        weeklyTraffic: [
+          { day: "Mon", value: 0 },
+          { day: "Tue", value: 0 },
+          { day: "Wed", value: 0 },
+          { day: "Thu", value: 0 },
+          { day: "Fri", value: 0 },
+          { day: "Sat", value: 0 },
+          { day: "Sun", value: 0 },
+        ],
+        autoAcceptGuests: true,
+        graceSecondsRemaining: null,
+        locationId: null,
+      });
     }
 
-    const visitsSnap = await guestVisitsCol.where("partnerId", "==", partnerId).get();
+    const locDoc = locSnap.docs[0];
+    const locationId = locDoc.id;
+    const locData = locDoc.data() || {};
 
-    const visits = visitsSnap.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-    }));
+    const autoAcceptGuests =
+      typeof locData.autoAcceptGuests === "boolean" ? locData.autoAcceptGuests : true;
+
+    // Grace seconds remaining
+    let graceSecondsRemaining = locData.graceUntil ? secondsRemaining(locData.graceUntil) : null;
+
+    // If grace ended and auto-accept ON, promote next (transaction lock)
+    if (autoAcceptGuests) {
+      const graceUntilMs = toMillis(locData.graceUntil);
+      const graceActive = graceUntilMs && graceUntilMs > Date.now();
+      if (!graceActive) {
+        await promoteNextVisitTransactional(locationId);
+        const freshLoc = await locationsCol.doc(locationId).get();
+        const fresh = freshLoc.exists ? freshLoc.data() : {};
+        graceSecondsRemaining = fresh?.graceUntil ? secondsRemaining(fresh.graceUntil) : null;
+      }
+    }
 
     const now = new Date();
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+    const endOfToday = new Date(now);
+    endOfToday.setHours(23, 59, 59, 999);
 
-    // Resolve primary location + compute grace seconds
-    let primaryLocationId = null;
-    let graceSecondsRemaining = null;
-    let autoAcceptGuests = true;
+    const startTs = admin.firestore.Timestamp.fromDate(startOfToday);
+    const endTs = admin.firestore.Timestamp.fromDate(endOfToday);
 
-    try {
-      const locSnap = await locationsCol.where("owner", "==", partnerId).limit(1).get();
-      if (!locSnap.empty) {
-        const locDoc = locSnap.docs[0];
-        primaryLocationId = locDoc.id;
+    // Requested today (requested/pending)
+    const requestedSnap = await guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("status", "in", ["requested", "pending"])
+      .where("createdAt", ">=", startTs)
+      .where("createdAt", "<=", endTs)
+      .orderBy("createdAt", "asc")
+      .get();
 
-        const locData = locDoc.data() || {};
-        if (typeof locData.autoAcceptGuests === "boolean") {
-          autoAcceptGuests = locData.autoAcceptGuests;
-        }
+    // Active now
+    const activeSnap = await guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("status", "==", "active")
+      .get();
 
-        // ✅ compute grace seconds remaining
-        if (locData.graceUntil) {
-          graceSecondsRemaining = secondsRemaining(locData.graceUntil);
-        }
-      }
-    } catch (e) {
-      // ignore
-    }
+    const requestedGuests = requestedSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const activeGuests = activeSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-    // ✅ If grace ended and auto-accept is on, promote the next queued guest
-    if (primaryLocationId) {
-      await maybePromoteNextVisit(primaryLocationId);
+    // ✅ Fix: totalGuestsToday counts ALL visits created today (any status)
+    const todayAllSnap = await guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("createdAt", ">=", startTs)
+      .where("createdAt", "<=", endTs)
+      .get();
 
-      // refresh graceSecondsRemaining after possible promotion
-      try {
-        const freshLoc = await locationsCol.doc(primaryLocationId).get();
-        const freshData = freshLoc.exists ? freshLoc.data() : null;
-        if (freshData?.graceUntil) {
-          graceSecondsRemaining = secondsRemaining(freshData.graceUntil);
-        } else {
-          graceSecondsRemaining = null;
-        }
-      } catch (e) {
-        // ignore
-      }
-    }
+    // Weekly traffic (last 7 days)
+    const sevenDaysAgo = new Date(now);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+    sevenDaysAgo.setHours(0, 0, 0, 0);
+    const sevenDaysTs = admin.firestore.Timestamp.fromDate(sevenDaysAgo);
 
-    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const todayName = dayNames[now.getDay()];
+    const weeklySnap = await guestVisitsCol
+      .where("locationId", "==", locationId)
+      .where("createdAt", ">=", sevenDaysTs)
+      .get();
 
-    // ✅ Requested guests (your system uses requested; keep backward-compat with pending)
-    const requestedGuests = visits.filter((v) => {
-      if (!["requested", "pending"].includes(v.status)) return false;
+    const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const trafficByDay = new Array(7).fill(0);
 
-      if (v.dayOfWeek) return v.dayOfWeek === todayName;
-
-      const ts = v.createdAt || v.startTime;
-      if (ts && typeof ts.toDate === "function") {
-        const dt = ts.toDate();
-        return dt.toDateString() === now.toDateString();
-      }
-      return false;
+    weeklySnap.forEach((doc) => {
+      const data = doc.data();
+      const raw = data.createdAt;
+      if (!raw || typeof raw.toDate !== "function") return;
+      const createdAt = raw.toDate();
+      const jsDay = createdAt.getDay(); // 0=Sun..6=Sat
+      const index = (jsDay + 6) % 7; // 0=Mon..6=Sun
+      trafficByDay[index] += 1;
     });
 
-    requestedGuests.sort(
-      (a, b) => (toMillis(a.createdAt) || 0) - (toMillis(b.createdAt) || 0)
-    );
-
-    const activeGuests = visits.filter((v) => v.status === "active");
-
-    const totalGuestsToday = visits.filter((v) => {
-      if (v.dayOfWeek) return v.dayOfWeek === todayName;
-      const ts = v.createdAt || v.startTime;
-      if (ts && typeof ts.toDate === "function") {
-        const dt = ts.toDate();
-        return dt.toDateString() === now.toDateString();
-      }
-      return false;
-    }).length;
+    const weeklyTraffic = trafficByDay.map((count, index) => ({
+      day: DAY_LABELS[index],
+      value: count,
+    }));
 
     const stats = {
       activeGuests: activeGuests.length,
-      totalGuestsToday,
+      totalGuestsToday: todayAllSnap.size,
     };
-
-    // Weekly traffic
-    const weeklyCounts = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
-
-    visits.forEach((v) => {
-      const ts = v.createdAt || v.startTime;
-      if (!ts || typeof ts.toDate !== "function") return;
-      const dt = ts.toDate();
-      weeklyCounts[dt.getDay()] = (weeklyCounts[dt.getDay()] || 0) + 1;
-    });
-
-    const shortDayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const order = [1, 2, 3, 4, 5, 6, 0]; // Mon..Sun
-
-    const weeklyTraffic = order.map((idx) => ({
-      day: shortDayLabels[idx],
-      value: weeklyCounts[idx] || 0,
-    }));
 
     return res.json({
       stats,
@@ -421,7 +429,8 @@ partnerRouter.get("/analytics", protect, async (req, res) => {
       activeGuests,
       weeklyTraffic,
       autoAcceptGuests,
-      graceSecondsRemaining, // ✅ now defined + returned
+      graceSecondsRemaining,
+      locationId,
     });
   } catch (err) {
     console.error("GET /partner/analytics error:", err);
@@ -431,6 +440,7 @@ partnerRouter.get("/analytics", protect, async (req, res) => {
 
 /**
  * POST /api/partner/guests/:visitId/accept
+ * Manual accept -> sets active + sets location lock
  */
 partnerRouter.post("/guests/:visitId/accept", protect, async (req, res) => {
   try {
@@ -438,74 +448,68 @@ partnerRouter.post("/guests/:visitId/accept", protect, async (req, res) => {
     const { visitId } = req.params;
 
     const visitRef = guestVisitsCol.doc(visitId);
-    const visitSnap = await visitRef.get();
 
-    if (!visitSnap.exists) {
-      return res.status(404).json({ error: "Visit not found" });
-    }
+    await firestore.runTransaction(async (tx) => {
+      const visitSnap = await tx.get(visitRef);
+      if (!visitSnap.exists) throw new Error("VISIT_NOT_FOUND");
 
-    const visit = visitSnap.data() || {};
-    if (visit.partnerId !== userId) {
-      return res.status(403).json({ error: "You are not allowed to manage this visit" });
-    }
+      const visit = visitSnap.data() || {};
+      const locationId = visit.locationId;
+      if (!locationId) throw new Error("VISIT_NO_LOCATION");
 
-    // ✅ accept supports requested (and pending for backward-compat)
-    if (visit.status !== "requested" && visit.status !== "pending") {
-      return res.status(400).json({ error: "Visit is not pending" });
-    }
+      const locRef = locationsCol.doc(locationId);
+      const locSnap = await tx.get(locRef);
+      if (!locSnap.exists) throw new Error("LOCATION_NOT_FOUND");
 
-    const locationId = visit.locationId;
-    if (!locationId) {
-      return res.status(400).json({ error: "Visit is missing a locationId" });
-    }
+      const loc = locSnap.data() || {};
+      if (loc.owner !== userId) throw new Error("NOT_ALLOWED");
 
-    const locRef = locationsCol.doc(locationId);
-    const locSnap = await locRef.get();
-    if (!locSnap.exists) {
-      return res.status(404).json({ error: "Location not found" });
-    }
+      if (!["requested", "pending"].includes(visit.status)) throw new Error("NOT_PENDING");
 
-    const graceUntilMs = toMillis(locSnap.data()?.graceUntil);
-    if (graceUntilMs && Date.now() < graceUntilMs) {
-      const diff = Math.ceil((graceUntilMs - Date.now()) / 1000);
-      return res.status(409).json({
-        error: "Location is in grace period",
-        graceSecondsRemaining: diff > 0 ? diff : 0,
-      });
-    }
+      // grace block
+      const graceUntilMs = toMillis(loc.graceUntil);
+      if (graceUntilMs && Date.now() < graceUntilMs) throw new Error("IN_GRACE");
 
-    const activeSnap = await guestVisitsCol
-      .where("locationId", "==", locationId)
-      .where("status", "==", "active")
-      .limit(1)
-      .get();
+      // lock block (avoid double active)
+      if (loc.currentActiveVisitId) throw new Error("ALREADY_ACTIVE");
 
-    if (!activeSnap.empty) {
-      return res.status(409).json({ error: "A guest is already active for this location" });
-    }
+      const nowTs = admin.firestore.Timestamp.now();
+      const maxDurationMinutes = Number(visit.maxDurationMinutes || 8);
+      const expiresAt = admin.firestore.Timestamp.fromMillis(
+        nowTs.toMillis() + maxDurationMinutes * 60 * 1000
+      );
 
-    const nowTs = admin.firestore.Timestamp.now();
-    const maxDurationMinutes = Number(visit.maxDurationMinutes || 8);
-    const expiresAt = admin.firestore.Timestamp.fromMillis(
-      nowTs.toMillis() + maxDurationMinutes * 60 * 1000
-    );
+      tx.set(
+        visitRef,
+        {
+          status: "active",
+          startTime: nowTs,
+          expiresAt,
+          accessCode: loc.accessCode || visit.accessCode || null,
+          instructions: loc.instructions || visit.instructions || null,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
 
-    const locData = locSnap.data() || {};
-
-    await visitRef.set(
-      {
-        status: "active",
-        startTime: nowTs,
-        expiresAt,
-        accessCode: locData.accessCode || visit.accessCode || null,
-        instructions: locData.instructions || visit.instructions || null,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+      tx.set(
+        locRef,
+        { currentActiveVisitId: visitId, updatedAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+    });
 
     return res.json({ id: visitId, status: "active" });
   } catch (err) {
+    const msg = err?.message || "";
+    if (msg === "VISIT_NOT_FOUND") return res.status(404).json({ error: "Visit not found" });
+    if (msg === "LOCATION_NOT_FOUND") return res.status(404).json({ error: "Location not found" });
+    if (msg === "NOT_ALLOWED") return res.status(403).json({ error: "Not allowed" });
+    if (msg === "NOT_PENDING") return res.status(400).json({ error: "Visit is not pending" });
+    if (msg === "IN_GRACE") return res.status(409).json({ error: "Location is in grace period" });
+    if (msg === "ALREADY_ACTIVE")
+      return res.status(409).json({ error: "A guest is already active for this location" });
+
     console.error("POST /partner/guests/:visitId/accept error:", err);
     return res.status(500).json({ error: "Server error" });
   }
@@ -513,7 +517,7 @@ partnerRouter.post("/guests/:visitId/accept", protect, async (req, res) => {
 
 /**
  * POST /api/partner/guests/:visitId/end
- * Starts grace period.
+ * Ends active visit -> clears lock + starts grace
  */
 partnerRouter.post("/guests/:visitId/end", protect, async (req, res) => {
   try {
@@ -521,59 +525,64 @@ partnerRouter.post("/guests/:visitId/end", protect, async (req, res) => {
     const { visitId } = req.params;
 
     const visitRef = guestVisitsCol.doc(visitId);
-    const visitSnap = await visitRef.get();
 
-    if (!visitSnap.exists) {
-      return res.status(404).json({ error: "Visit not found" });
-    }
+    const result = await firestore.runTransaction(async (tx) => {
+      const visitSnap = await tx.get(visitRef);
+      if (!visitSnap.exists) throw new Error("VISIT_NOT_FOUND");
+      const visit = visitSnap.data() || {};
 
-    const visit = visitSnap.data() || {};
-    const locationId = visit.locationId;
+      const locationId = visit.locationId;
+      if (!locationId) throw new Error("VISIT_NO_LOCATION");
 
-    if (!locationId) {
-      return res.status(400).json({ error: "Visit is missing a locationId" });
-    }
+      const locRef = locationsCol.doc(locationId);
+      const locSnap = await tx.get(locRef);
+      if (!locSnap.exists) throw new Error("LOCATION_NOT_FOUND");
 
-    const locRef = locationsCol.doc(locationId);
-    const locSnap = await locRef.get();
+      const loc = locSnap.data() || {};
+      if (loc.owner !== userId) throw new Error("NOT_ALLOWED");
+      if (visit.status !== "active") throw new Error("NOT_ACTIVE");
 
-    if (!locSnap.exists) {
-      return res.status(404).json({ error: "Location not found" });
-    }
+      const nowTs = admin.firestore.Timestamp.now();
+      const graceUntil = admin.firestore.Timestamp.fromMillis(
+        nowTs.toMillis() + GRACE_SECONDS * 1000
+      );
 
-    const locData = locSnap.data() || {};
-    if (locData.owner !== userId) {
-      return res.status(403).json({ error: "You are not allowed to manage visits for this location" });
-    }
+      tx.set(
+        visitRef,
+        {
+          status: "completed",
+          endTime: nowTs,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
 
-    if (visit.status !== "active") {
-      return res.status(400).json({ error: "Visit is not currently active" });
-    }
-
-    const nowTs = admin.firestore.Timestamp.now();
-    const graceUntil = admin.firestore.Timestamp.fromMillis(
-      nowTs.toMillis() + GRACE_SECONDS * 1000
-    );
-
-    await visitRef.set(
-      {
-        status: "completed",
-        endTime: nowTs,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    await locRef.set(
-      {
+      // clear active lock if pointing to this visit
+      const updates = {
         graceUntil,
         updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+      };
+      if (loc.currentActiveVisitId === visitId) {
+        updates.currentActiveVisitId = null;
+      }
+      tx.set(locRef, updates, { merge: true });
 
-    return res.json({ id: visitId, status: "completed", graceSecondsRemaining: GRACE_SECONDS });
+      return { graceSecondsRemaining: GRACE_SECONDS };
+    });
+
+    return res.json({
+      id: visitId,
+      status: "completed",
+      graceSecondsRemaining: result.graceSecondsRemaining,
+    });
   } catch (err) {
+    const msg = err?.message || "";
+    if (msg === "VISIT_NOT_FOUND") return res.status(404).json({ error: "Visit not found" });
+    if (msg === "LOCATION_NOT_FOUND") return res.status(404).json({ error: "Location not found" });
+    if (msg === "NOT_ALLOWED") return res.status(403).json({ error: "Not allowed" });
+    if (msg === "NOT_ACTIVE")
+      return res.status(400).json({ error: "Visit is not currently active" });
+
     console.error("POST /partner/guests/:visitId/end error:", err);
     return res.status(500).json({ error: "Server error" });
   }
@@ -600,7 +609,15 @@ partnerRouter.put(
 
     try {
       const userId = req.user.userId || req.user.id;
-      const { name, address, accessCode, price = 0, description = "", features = [], photos = [] } = req.body;
+      const {
+        name,
+        address,
+        accessCode,
+        price = 0,
+        description = "",
+        features = [],
+        photos = [],
+      } = req.body;
 
       const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
 
@@ -622,9 +639,7 @@ partnerRouter.put(
 
       if (addressChanged || !coordinates) {
         const geo = await geocodeAddress(address || existing.address);
-        if (geo) {
-          coordinates = geo;
-        }
+        if (geo) coordinates = geo;
       }
 
       const update = {
@@ -682,7 +697,6 @@ partnerRouter.post("/onboard-link", protect, async (req, res) => {
     }
 
     const FRONTEND_URL = process.env.FRONTEND_URL || "https://pay2pee.app";
-
     const returnUrl = `${FRONTEND_URL}/partner`;
     const refreshUrl = `${FRONTEND_URL}/partner`;
 
@@ -699,9 +713,9 @@ partnerRouter.post("/onboard-link", protect, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
+// ------------------------------
 // Host router -> /api/host/*
-// ─────────────────────────────────────────────────────────────
+// ------------------------------
 const hostRouter = express.Router();
 
 /**
@@ -734,15 +748,14 @@ hostRouter.put(
 );
 
 /**
- * PUT /api/host/auto-accept
+ * ✅ FIXED: PUT /api/host/auto-accept
+ * - locationId is OPTIONAL (backend will infer by owner)
+ * Body: { autoAcceptGuests, locationId? }
  */
 hostRouter.put(
   "/auto-accept",
   protect,
-  [
-    body("locationId").notEmpty().withMessage("locationId is required"),
-    body("autoAcceptGuests").isBoolean().withMessage("autoAcceptGuests must be true or false"),
-  ],
+  [body("autoAcceptGuests").isBoolean().withMessage("autoAcceptGuests must be true or false")],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -751,16 +764,24 @@ hostRouter.put(
       const userId = req.user.userId || req.user.id;
       const { locationId, autoAcceptGuests } = req.body;
 
-      const ref = locationsCol.doc(locationId);
-      const snap = await ref.get();
-      if (!snap.exists) return res.status(404).json({ error: "Location not found" });
+      let ref;
 
-      const loc = snap.data() || {};
-      if (loc.owner !== userId) {
-        return res.status(403).json({ error: "You are not allowed to update this location" });
+      if (locationId) {
+        ref = locationsCol.doc(locationId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ error: "Location not found" });
+
+        const loc = snap.data() || {};
+        if (loc.owner !== userId) {
+          return res.status(403).json({ error: "You are not allowed to update this location" });
+        }
+      } else {
+        const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+        if (snap.empty) return res.status(404).json({ error: "Location not found" });
+        ref = snap.docs[0].ref;
       }
 
-      await ref.set({ autoAcceptGuests }, { merge: true });
+      await ref.set({ autoAcceptGuests, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
 
       const updated = await ref.get();
       const updatedLoc = updated.data() || {};
