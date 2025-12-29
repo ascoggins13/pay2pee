@@ -1,4 +1,4 @@
-// routes/locationRoutes.js (super simple, GeoPoint-safe)
+// routes/locationRoutes.js (GeoPoint-safe + fixes nearby crash)
 const express = require("express");
 const { body, validationResult } = require("express-validator");
 const { admin, firestore } = require("../firebase-admin");
@@ -7,14 +7,62 @@ const protect = require("../middleware/protect");
 const router = express.Router();
 const locationsCol = firestore.collection("locations");
 
+// ✅ Normalize Firestore coordinate shapes into { lat, lng } for the frontend map
+function normalizeCoordinates(raw) {
+  if (!raw) return null;
+
+  // Firestore GeoPoint
+  if (
+    typeof raw === "object" &&
+    typeof raw.latitude === "number" &&
+    typeof raw.longitude === "number" &&
+    raw._latitude === undefined // (avoid some weird serialized shapes)
+  ) {
+    return { lat: raw.latitude, lng: raw.longitude };
+  }
+
+  // If it was stored as { latitude, longitude }
+  if (
+    typeof raw === "object" &&
+    typeof raw.latitude === "number" &&
+    typeof raw.longitude === "number"
+  ) {
+    return { lat: raw.latitude, lng: raw.longitude };
+  }
+
+  // If it was stored as { lat, lng }
+  if (typeof raw === "object" && typeof raw.lat === "number" && typeof raw.lng === "number") {
+    return { lat: raw.lat, lng: raw.lng };
+  }
+
+  // If it was stored as strings
+  if (
+    typeof raw === "object" &&
+    raw.latitude != null &&
+    raw.longitude != null &&
+    !Number.isNaN(parseFloat(raw.latitude)) &&
+    !Number.isNaN(parseFloat(raw.longitude))
+  ) {
+    return { lat: parseFloat(raw.latitude), lng: parseFloat(raw.longitude) };
+  }
+
+  if (
+    typeof raw === "object" &&
+    raw.lat != null &&
+    raw.lng != null &&
+    !Number.isNaN(parseFloat(raw.lat)) &&
+    !Number.isNaN(parseFloat(raw.lng))
+  ) {
+    return { lat: parseFloat(raw.lat), lng: parseFloat(raw.lng) };
+  }
+
+  return null;
+}
+
 /* ─────────────────────────────────────────────
  * GET /api/locations/nearby
  *
- * Query (optional):
- *   lat, lng, radiusKm – IGNORED for now, we just return active locations.
- *
- * Returns:
- *   { locations: [ { id, ...doc.data() }, ... ] }
+ * Returns active locations and normalizes coordinates for map pins.
  * ────────────────────────────────────────────*/
 router.get("/nearby", async (req, res) => {
   try {
@@ -26,21 +74,21 @@ router.get("/nearby", async (req, res) => {
       .get();
 
     const locations = [];
+
     snap.forEach((doc) => {
-      try {
-        const data = doc.data() || {};
-        // Just spread everything, including GeoPoint, photos, etc.
-        locations.push({
-          id: doc.id,
-          ...data,
-          coordinates, // ✅ normalized for the frontend map
-        });
-      } catch (docErr) {
-        console.error(
-          `Error processing location doc ${doc.id}:`,
-          docErr?.message || docErr
-        );
-      }
+      const data = doc.data() || {};
+
+      // Optional: hide non-public if you want guests to only see public
+      // (won’t break docs that don’t have isPublic)
+      if (data.isPublic === false) return;
+
+      const coords = normalizeCoordinates(data.coordinates);
+
+      locations.push({
+        id: doc.id,
+        ...data,
+        coordinates: coords, // ✅ frontend expects {lat,lng} (or null)
+      });
     });
 
     return res.json({ locations });
@@ -75,15 +123,13 @@ router.get("/me", protect, async (req, res) => {
 
 /**
  * PUT /api/locations/me (partner)
- * Expects coordinates like { latitude, longitude }
+ * Expects coordinates like { latitude, longitude } OR { lat, lng }
  */
 router.put(
   "/me",
   protect,
   [
     body("address").not().isEmpty().withMessage("Address is required"),
-    body("coordinates.latitude").isFloat({ min: -90, max: 90 }),
-    body("coordinates.longitude").isFloat({ min: -180, max: 180 }),
     body("pricing.basePrice").isFloat({ min: 0 }),
     body("pricing.surgeMultiplier").optional().isFloat({ min: 1 }),
     body("isPublic").optional().isBoolean(),
@@ -104,10 +150,11 @@ router.put(
         isActive = false,
       } = req.body;
 
+      // Store coordinates as-is (GeoPoint or object). Frontend gets normalized via /nearby.
       const payload = {
         owner: req.user.userId,
         address,
-        coordinates, // { latitude, longitude } or GeoPoint-like object
+        coordinates: coordinates || null,
         pricing: {
           basePrice: pricing.basePrice,
           surgeMultiplier: pricing.surgeMultiplier || 1,
