@@ -6,8 +6,6 @@ const protect = require("../middleware/protect");
 
 const router = express.Router();
 const locationsCol = firestore.collection("locations");
-// 🔹 NEW: guest visits collection so we can count today's visitors
-const guestVisitsCol = firestore.collection("guestVisits");
 
 /* ─────────────────────────────────────────────
  * GET /api/locations/nearby
@@ -16,7 +14,7 @@ const guestVisitsCol = firestore.collection("guestVisits");
  *   lat, lng, radiusKm – IGNORED for now, we just return active locations.
  *
  * Returns:
- *   { locations: [ { id, ...doc.data(), todayVisitCount }, ... ] }
+ *   { locations: [ { id, ...doc.data() }, ... ] }
  * ────────────────────────────────────────────*/
 router.get("/nearby", async (req, res) => {
   try {
@@ -35,6 +33,7 @@ router.get("/nearby", async (req, res) => {
         locations.push({
           id: doc.id,
           ...data,
+          coordinates, // ✅ normalized for the frontend map
         });
       } catch (docErr) {
         console.error(
@@ -44,45 +43,7 @@ router.get("/nearby", async (req, res) => {
       }
     });
 
-    // 🔹 NEW: aggregate today's visit counts by locationId
-    const now = new Date();
-    const startOfDay = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate()
-    );
-
-    const countsByLocation = {};
-
-    try {
-      const visitsSnap = await guestVisitsCol
-        .where(
-          "createdAt",
-          ">=",
-          admin.firestore.Timestamp.fromDate(startOfDay)
-        )
-        .get();
-
-      visitsSnap.forEach((visitDoc) => {
-        const v = visitDoc.data() || {};
-        const locId = v.locationId;
-        if (!locId) return;
-
-        // If you want to filter by status, uncomment this:
-        // if (!["active", "completed", "expired"].includes(v.status)) return;
-
-        countsByLocation[locId] = (countsByLocation[locId] || 0) + 1;
-      });
-    } catch (visitErr) {
-      console.error("Error aggregating today visit counts:", visitErr);
-    }
-
-    const enriched = locations.map((loc) => ({
-      ...loc,
-      todayVisitCount: countsByLocation[loc.id] || 0,
-    }));
-
-    return res.json({ locations: enriched });
+    return res.json({ locations });
   } catch (err) {
     console.error("GET /locations/nearby error:", err);
     return res.status(500).json({ error: "Server error" });
