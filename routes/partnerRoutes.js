@@ -319,14 +319,15 @@ partnerRouter.get("/analytics", protect, async (req, res) => {
         requestedGuests: [],
         activeGuests: [],
         weeklyTraffic: [
-          { day: "Mon", value: 0 },
-          { day: "Tue", value: 0 },
-          { day: "Wed", value: 0 },
-          { day: "Thu", value: 0 },
-          { day: "Fri", value: 0 },
-          { day: "Sat", value: 0 },
-          { day: "Sun", value: 0 },
+          { day: "Monday", value: 0 },
+          { day: "Tuesday", value: 0 },
+          { day: "Wednesday", value: 0 },
+          { day: "Thursday", value: 0 },
+          { day: "Friday", value: 0 },
+          { day: "Saturday", value: 0 },
+          { day: "Sunday", value: 0 },
         ],
+        
         autoAcceptGuests: true,
         graceSecondsRemaining: null,
         locationId: null,
@@ -400,7 +401,8 @@ partnerRouter.get("/analytics", protect, async (req, res) => {
       .where("createdAt", ">=", sevenDaysTs)
       .get();
 
-    const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+      const DAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
     const trafficByDay = new Array(7).fill(0);
 
     weeklySnap.forEach((doc) => {
@@ -467,7 +469,8 @@ partnerRouter.post("/guests/:visitId/accept", protect, async (req, res) => {
       if (!["requested", "pending"].includes(visit.status)) throw new Error("NOT_PENDING");
 
       // grace block
-      const graceUntilMs = toMillis(loc.graceUntil);
+      const graceUntilMs = toMillis(loc.graceEndsAt);
+
       if (graceUntilMs && Date.now() < graceUntilMs) throw new Error("IN_GRACE");
 
       // lock block (avoid double active)

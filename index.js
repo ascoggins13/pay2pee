@@ -51,6 +51,7 @@ const chatRoutes = require('./routes/chatRoutes');
 
 app.use('/api/chat', chatRoutes);
 
+const leadsRoutes = require('./routes/leadsRoutes');
 
 /* ---------------------- HEALTHCHECK ----------------------- */
 
