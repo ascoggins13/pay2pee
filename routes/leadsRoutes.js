@@ -1,12 +1,7 @@
 // routes/leadsRoutes.js
 const express = require("express");
 const router = express.Router();
-
-const admin = require("firebase-admin");
-const db = admin.firestore();
-
-// (optional but super helpful) quick ping to confirm mounting works
-router.get("/_ping", (req, res) => res.json({ ok: true }));
+const { admin, db } = require("../firebase-admin"); // adjust path if needed
 
 router.post("/partner", async (req, res) => {
   try {
@@ -31,7 +26,10 @@ router.post("/partner", async (req, res) => {
     return res.json({ ok: true, id: ref.id });
   } catch (e) {
     console.error("POST /api/leads/partner error:", e);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({
+      error: "Server error",
+      message: e?.message || String(e),
+    });
   }
 });
 
