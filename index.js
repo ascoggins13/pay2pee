@@ -51,8 +51,8 @@ const chatRoutes = require('./routes/chatRoutes');
 
 app.use('/api/chat', chatRoutes);
 
-const leadsRoutes = require('./routes/leadsRoutes');
-
+const leadsRoutes = require("./routes/leadsRoutes");
+app.use("/api/leads", leadsRoutes);
 /* ---------------------- HEALTHCHECK ----------------------- */
 
 app.get('/api/health', (_req, res) => {

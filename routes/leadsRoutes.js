@@ -2,9 +2,11 @@
 const express = require("express");
 const router = express.Router();
 
-// however you already initialize admin/firestore in your project:
 const admin = require("firebase-admin");
 const db = admin.firestore();
+
+// (optional but super helpful) quick ping to confirm mounting works
+router.get("/_ping", (req, res) => res.json({ ok: true }));
 
 router.post("/partner", async (req, res) => {
   try {
