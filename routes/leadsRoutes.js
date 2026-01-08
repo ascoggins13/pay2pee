@@ -3,6 +3,11 @@ const router = express.Router();
 
 const { admin, firestore } = require("../firebase-admin.js");
 
+console.log("LEADS firebase-admin resolved to:", require.resolve("../firebase-admin.js"));
+const fb = require("../firebase-admin.js");
+console.log("LEADS firebase keys:", Object.keys(fb));
+console.log("LEADS has firestore?", !!fb.firestore, "type:", typeof fb.firestore);
+
 router.post("/partner", async (req, res) => {
   try {
     const { venueName, location, email, source, page, userAgent } = req.body || {};

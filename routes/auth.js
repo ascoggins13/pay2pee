@@ -13,6 +13,11 @@ const SALT_ROUNDS = 10;
 const normalizeEmail = (e) => (e || '').trim().toLowerCase();
 const now = () => admin.firestore.FieldValue.serverTimestamp();
 
+console.log("LEADS firebase-admin resolved to:", require.resolve("../firebase-admin.js"));
+const fb = require("../firebase-admin.js");
+console.log("LEADS firebase keys:", Object.keys(fb));
+console.log("LEADS has firestore?", !!fb.firestore, "type:", typeof fb.firestore);
+
 function issueJwt({ userId, email, userType }) {
   return jwt.sign({ userId, email, userType }, JWT_SECRET, { expiresIn: '7d' });
 }
