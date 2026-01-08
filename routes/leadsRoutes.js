@@ -1,8 +1,13 @@
 // routes/leadsRoutes.js
 const express = require("express");
 const router = express.Router();
-const { admin, db } = require("../firebase-admin"); // adjust path if needed
 
+const fb = require("../firebase-admin"); // ✅ import the module as an object
+
+const admin = fb.admin;
+const db = fb.firestore; // ✅ this is your Firestore instance
+console.log("LEADS firestore ok?", !!db, "type:", typeof db);
+// ========================
 router.post("/partner", async (req, res) => {
   try {
     const { venueName, location, email, source, page, userAgent } = req.body || {};
