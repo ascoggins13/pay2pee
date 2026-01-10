@@ -1,65 +1,61 @@
 // firebase-admin.js
-// Centralized Firebase Admin + Firestore config for Pay2Pee
+// One place to initialize Firebase Admin cleanly for Render/Node.
 
-const admin = require("firebase-admin");
+const admin = require('firebase-admin');
 
-let serviceAccount = null;
-
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-    // Fix common Render/ENV issue: private_key newlines
-    if (serviceAccount.private_key) {
-      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+function parseServiceAccount() {
+  // Preferred: put your service account JSON (one-line) in FIREBASE_SERVICE_ACCOUNT
+  // Fallbacks: GOOGLE_APPLICATION_CREDENTIALS (path) or applicationDefault()
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+      return admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+    } catch (e) {
+      console.error('❌ Failed to JSON.parse(FIREBASE_SERVICE_ACCOUNT):', e.message);
+      throw e;
     }
-  } catch (err) {
-    console.error("❌ Failed to parse FIREBASE_SERVICE_ACCOUNT:", err.message || err);
   }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return admin.credential.applicationDefault();
+  }
+  return admin.credential.applicationDefault();
 }
 
 if (!admin.apps.length) {
-  if (serviceAccount) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      storageBucket:
-        process.env.FIREBASE_STORAGE_BUCKET ||
-        `${serviceAccount.project_id}.appspot.com`,
-    });
-  } else {
-    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT missing/invalid — using default credentials.");
-    admin.initializeApp();
-  }
+  const credential = parseServiceAccount();
+
+  // Pick projectId and storage bucket smartly
+  const projectId =
+    process.env.FIREBASE_PROJECT_ID ||
+    (process.env.FIREBASE_SERVICE_ACCOUNT
+      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT).project_id
+      : undefined);
+
+  // IMPORTANT: Firestore uses PROJECT.appspot.com buckets for Admin SDK
+  const defaultBucket =
+    process.env.FIREBASE_STORAGE_BUCKET ||
+    (projectId ? `${projectId}.appspot.com` : undefined);
+
+  admin.initializeApp({
+    credential,
+    projectId,
+    storageBucket: defaultBucket,
+  });
 }
 
-// ✅ Always use Admin SDK Firestore instance for compatibility with your routes
 const firestore = admin.firestore();
-
-// Storage bucket (safe even if you don't use it everywhere)
 const bucket = admin.storage().bucket();
 
-function getFirebaseConfigInfo() {
+// Small helpers for debugging
+function resolvedInfo() {
+  const app = admin.app();
   return {
-    projectId: admin.app().options.projectId || serviceAccount?.project_id || null,
-    storageBucket: admin.app().options.storageBucket || null,
-    from: serviceAccount ? "SERVICE_ACCOUNT" : "DEFAULT",
+    resolvedProjectId:
+      app.options.projectId ||
+      (process.env.FIREBASE_SERVICE_ACCOUNT
+        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT).project_id
+        : undefined),
+    storageBucket: app.options.storageBucket,
   };
 }
 
-async function firestoreSmokeTest() {
-  try {
-    const cols = await firestore.listCollections();
-    return { ok: true, count: cols.length };
-  } catch (err) {
-    console.error("🔥 firestoreSmokeTest error:", err);
-    return { ok: false, message: String(err.message || err) };
-  }
-}
-
-module.exports = {
-  admin,
-  firestore,
-  bucket,
-  getFirebaseConfigInfo,
-  firestoreSmokeTest,
-};
+module.exports = { admin, firestore, bucket, resolvedInfo };
