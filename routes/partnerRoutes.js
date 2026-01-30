@@ -1,44 +1,72 @@
-// routes/partnerRoutes.js
+// routes/paymentsRoutes.js
 const express = require("express");
 const { body, validationResult } = require("express-validator");
-const axios = require("axios");
-
 const protect = require("../middleware/protect");
-const { admin, firestore } = require("../firebase-admin");
-const stripeService = require("../services/stripeService");
+const payments = require("../controllers/paymentsController");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { firestore, admin } = require("../firebase-admin");
+const { createNotification } = require("../services/notificationService");
 
-const usersCol = firestore.collection("users");
-const partnersCol = firestore.collection("partners");
-const locationsCol = firestore.collection("locations");
+const router = express.Router();
+
 const guestVisitsCol = firestore.collection("guestVisits");
-const FieldValue = admin.firestore.FieldValue;
+const locationsCol = firestore.collection("locations");
+const partnersCol = firestore.collection("partners");
 
+// ------------------------------
+// Queue + Grace Period Helpers
+// ------------------------------
 const GRACE_SECONDS = 180;
 
-// ------------------------------
-// Helpers
-// ------------------------------
 function toMillis(ts) {
   if (!ts) return null;
   if (typeof ts === "number") return ts;
   if (typeof ts === "string") {
     const d = new Date(ts);
-    const ms = d.getTime();
-    return Number.isFinite(ms) ? ms : null;
+    return Number.isNaN(d.getTime()) ? null : d.getTime();
   }
   if (typeof ts?.toMillis === "function") return ts.toMillis();
   if (ts?._seconds) return ts._seconds * 1000;
   return null;
 }
 
-function secondsRemaining(futureTs) {
-  const ms = toMillis(futureTs);
-  if (!ms) return null;
-  return Math.max(0, Math.floor((ms - Date.now()) / 1000));
+async function computeGrace(locationId) {
+  if (!locationId) return { graceUntil: null, graceSecondsRemaining: null };
+  const locSnap = await locationsCol.doc(locationId).get();
+  if (!locSnap.exists) return { graceUntil: null, graceSecondsRemaining: null };
+
+  const graceUntil = locSnap.data()?.graceUntil || null;
+  const graceUntilMs = toMillis(graceUntil);
+  if (!graceUntilMs) return { graceUntil: null, graceSecondsRemaining: null };
+
+  const remaining = Math.max(0, Math.ceil((graceUntilMs - Date.now()) / 1000));
+  return { graceUntil, graceSecondsRemaining: remaining };
 }
 
-async function promoteNextVisitTransactional(locationId) {
+async function setGraceWindow(locationId, tx) {
+  if (!locationId) return null;
+  const graceUntil = admin.firestore.Timestamp.fromMillis(
+    Date.now() + GRACE_SECONDS * 1000
+  );
+  const ref = locationsCol.doc(locationId);
+
+  if (tx) {
+    tx.set(
+      ref,
+      { graceUntil, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+  } else {
+    await ref.set(
+      { graceUntil, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+  }
+
+  return graceUntil;
+}
+
+async function maybePromoteNextQueuedTransactional(locationId) {
   if (!locationId) return null;
 
   const locRef = locationsCol.doc(locationId);
@@ -50,36 +78,28 @@ async function promoteNextVisitTransactional(locationId) {
     const loc = locSnap.data() || {};
     if (!loc.autoAcceptGuests) return null;
 
-    // lock: only one active
+    // lock: only one active at a time
     if (loc.currentActiveVisitId) return null;
 
-    // grace blocks promotion
+    // respect grace
     const graceUntilMs = toMillis(loc.graceUntil);
     if (graceUntilMs && graceUntilMs > Date.now()) return null;
 
-    // if some older active exists but lock wasn't set, still avoid promoting
-    const activeQ = guestVisitsCol
-      .where("locationId", "==", locationId)
-      .where("status", "==", "active")
-      .limit(1);
-
-    const activeSnap = await tx.get(activeQ);
-    if (!activeSnap.empty) return null;
-
-    const queuedQ = guestVisitsCol
+    // find oldest queued (requested/pending)
+    const q = guestVisitsCol
       .where("locationId", "==", locationId)
       .where("status", "in", ["requested", "pending"])
       .orderBy("createdAt", "asc")
       .limit(1);
 
-    const queuedSnap = await tx.get(queuedQ);
-    if (queuedSnap.empty) return null;
+    const qSnap = await tx.get(q);
+    if (qSnap.empty) return null;
 
-    const doc = queuedSnap.docs[0];
-    const visit = doc.data() || {};
+    const doc = qSnap.docs[0];
+    const queued = doc.data() || {};
 
     const now = admin.firestore.Timestamp.now();
-    const maxMinutes = Number(visit.maxDurationMinutes || 8);
+    const maxMinutes = Number(queued.maxDurationMinutes || 8);
     const expiresAt = admin.firestore.Timestamp.fromMillis(
       now.toMillis() + maxMinutes * 60 * 1000
     );
@@ -90,9 +110,9 @@ async function promoteNextVisitTransactional(locationId) {
         status: "active",
         startTime: now,
         expiresAt,
-        accessCode: loc.accessCode || visit.accessCode || null,
-        instructions: loc.instructions || visit.instructions || null,
-        updatedAt: FieldValue.serverTimestamp(),
+        accessCode: loc.accessCode || queued.accessCode || null,
+        instructions: loc.instructions || queued.instructions || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
@@ -101,732 +121,524 @@ async function promoteNextVisitTransactional(locationId) {
       locRef,
       {
         currentActiveVisitId: doc.id,
-        updatedAt: FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    return { id: doc.id, ...visit, status: "active", startTime: now, expiresAt };
+    return { id: doc.id, ...queued, status: "active", startTime: now, expiresAt };
   });
 
   return promoted;
 }
 
-// Helper: geocode
-async function geocodeAddress(address) {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey || !address) return null;
-
-  try {
-    const res = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
-      params: { address, key: apiKey },
-    });
-
-    if (
-      !res.data ||
-      res.data.status !== "OK" ||
-      !Array.isArray(res.data.results) ||
-      res.data.results.length === 0
-    ) {
-      console.warn("Geocoding failed:", res.data?.status, res.data?.error_message);
-      return null;
-    }
-
-    const loc = res.data.results[0].geometry.location;
-    return { lat: loc.lat, lng: loc.lng };
-  } catch (err) {
-    console.error("Geocoding error:", err);
-    return null;
-  }
-}
-
-// ------------------------------
-// Partner router -> /api/partner/*
-// ------------------------------
-const partnerRouter = express.Router();
-
 /**
- * GET /api/partner/summary
+ * GET /api/payments/prices
  */
-partnerRouter.get("/summary", protect, async (req, res) => {
+router.get("/prices", protect, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
-
-    const [userDoc, partnerDoc, locSnap] = await Promise.all([
-      usersCol.doc(userId).get(),
-      partnersCol.doc(userId).get(),
-      locationsCol.where("owner", "==", userId).limit(1).get(),
-    ]);
-
-    const user = userDoc.exists ? userDoc.data() : {};
-    const partner = partnerDoc.exists ? partnerDoc.data() : {};
-
-    const hasLocation = !locSnap.empty;
-    const locDoc = hasLocation ? locSnap.docs[0] : null;
-    const loc = hasLocation ? locDoc.data() : {};
-    const locId = hasLocation ? locDoc.id : null;
-
-    // Refresh Stripe status live
-    let stripeStatus = partner.stripeStatus || {};
-    if (
-      partner.stripeAccountId &&
-      stripeService &&
-      typeof stripeService.getAccount === "function"
-    ) {
-      try {
-        const acct = await stripeService.getAccount(partner.stripeAccountId);
-        stripeStatus = {
-          charges_enabled: !!acct.charges_enabled,
-          payouts_enabled: !!acct.payouts_enabled,
-          details_submitted: !!acct.details_submitted,
-        };
-
-        await partnersCol.doc(userId).set(
-          {
-            stripeStatus,
-            onboardingStatus: acct.details_submitted ? "verified" : "pending_verification",
-            updatedAt: new Date().toISOString(),
-          },
-          { merge: true }
-        );
-      } catch (err) {
-        console.error("Error refreshing Stripe account status:", err);
-        stripeStatus = partner.stripeStatus || {};
-      }
-    }
-
-    // Stripe balance
-    let stripeBalanceTotal = null;
-    let stripeAvailable = null;
-    let stripePending = null;
-
-    if (partner.stripeAccountId && process.env.STRIPE_SECRET_KEY) {
-      try {
-        const bal = await stripe.balance.retrieve({
-          stripeAccount: partner.stripeAccountId,
-        });
-
-        const avail = Array.isArray(bal.available) ? bal.available[0] : null;
-        const pend = Array.isArray(bal.pending) ? bal.pending[0] : null;
-
-        stripeAvailable = avail ? avail.amount / 100 : 0;
-        stripePending = pend ? pend.amount / 100 : 0;
-        stripeBalanceTotal = (stripeAvailable || 0) + (stripePending || 0);
-      } catch (err) {
-        console.error("Error fetching Stripe balance in /partner/summary:", err);
-      }
-    }
-
-    const totalBalance =
-      stripeBalanceTotal !== null ? stripeBalanceTotal : Number(partner.pendingPayout || 0);
-
-    const availableBalance = stripeAvailable !== null ? stripeAvailable : totalBalance;
-    const pendingBalance = stripePending !== null ? stripePending : null;
-
-    // Today visits count (all visits created today for this location)
-    let todayCount = 0;
-    if (locId) {
-      try {
-        const now = new Date();
-        const start = new Date(now);
-        start.setHours(0, 0, 0, 0);
-        const end = new Date(now);
-        end.setHours(23, 59, 59, 999);
-
-        const startTs = admin.firestore.Timestamp.fromDate(start);
-        const endTs = admin.firestore.Timestamp.fromDate(end);
-
-        const visitsSnap = await guestVisitsCol
-          .where("locationId", "==", locId)
-          .where("createdAt", ">=", startTs)
-          .where("createdAt", "<=", endTs)
-          .get();
-
-        todayCount = visitsSnap.size || 0;
-      } catch (err) {
-        console.error("Error computing todayVisits in /partner/summary:", err);
-      }
-    }
-
-    return res.json({
-      partnerId: userId,
-      email: user.email || partner.email || null,
-
-      name: loc.name || partner.businessName || "Your Bathroom Name",
-      address:
-        loc.address || partner.businessAddress || "Add your address so guests can find you.",
-      isActive: loc.isActive !== false,
-
-      todayVisits: todayCount,
-
-      currentBalance: totalBalance,
-      availableBalance,
-      pendingBalance,
-      stripeBalance: totalBalance,
-      stripeAvailableBalance: availableBalance,
-      stripePendingBalance: pendingBalance,
-
-      lastPayoutDate: partner.lastPayoutDate || null,
-      rating: loc.rating || 4.8,
-
-      reviews: Array.isArray(loc.recentReviews) ? loc.recentReviews : [],
-      activeGuests: Array.isArray(loc.activeGuests) ? loc.activeGuests : [],
-
-      locationDetails: {
-        price: Number(loc.price || loc.pricing?.basePrice || 0),
-        accessCode: loc.accessCode || "",
-        hours: loc.hours || "—",
-        description: loc.description || "",
-        features: Array.isArray(loc.amenities) ? loc.amenities : [],
-        photos: Array.isArray(loc.photos) ? loc.photos : [],
-      },
-
-      ownerName:
-        partner.ownerName ||
-        user.name ||
-        (user.email ? user.email.split("@")[0] : "Partner"),
-      avatarUrl: partner.avatarUrl || user.avatarUrl || "",
-
-      stripeAccountId: partner.stripeAccountId || null,
-      stripeStatus: {
-        charges_enabled: !!stripeStatus.charges_enabled,
-        payouts_enabled: !!stripeStatus.payouts_enabled,
-        details_submitted: !!stripeStatus.details_submitted,
-      },
-    });
+    const prices = await payments.getNormalizedPrices();
+    res.json({ prices });
   } catch (err) {
-    console.error("GET /partner/summary error:", err);
-    return res.status(500).json({ error: "Server error" });
+    console.error("Error fetching prices:", err);
+    res.status(500).json({ error: "Failed to fetch prices" });
   }
 });
 
 /**
- * GET /api/partner/analytics
- * Returns:
- * { stats, requestedGuests, activeGuests, weeklyTraffic, autoAcceptGuests, graceSecondsRemaining, locationId }
- *
- * ✅ Fix: totalGuestsToday is now consistent (counts ALL visits created today)
+ * POST /api/payments/subscriptions
  */
-partnerRouter.get("/analytics", protect, async (req, res) => {
-  try {
-    const partnerId = req.user.userId || req.user.id;
-    if (!partnerId) return res.status(400).json({ error: "Missing partner id" });
+router.post(
+  "/subscriptions",
+  protect,
+  [body("priceId", "priceId is required").notEmpty()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const locSnap = await locationsCol.where("owner", "==", partnerId).limit(1).get();
-    if (locSnap.empty) {
-      return res.json({
-        stats: { activeGuests: 0, totalGuestsToday: 0 },
-        requestedGuests: [],
-        activeGuests: [],
-        weeklyTraffic: [
-          { day: "Monday", value: 0 },
-          { day: "Tuesday", value: 0 },
-          { day: "Wednesday", value: 0 },
-          { day: "Thursday", value: 0 },
-          { day: "Friday", value: 0 },
-          { day: "Saturday", value: 0 },
-          { day: "Sunday", value: 0 },
-        ],
-        
-        autoAcceptGuests: true,
-        graceSecondsRemaining: null,
-        locationId: null,
+    try {
+      const { priceId } = req.body;
+      const session = await payments.createCheckoutSession({
+        priceId,
+        mode: "subscription",
+        user: req.user,
       });
+      res.json({ sessionId: session.id, url: session.url });
+    } catch (err) {
+      console.error("subscription checkout error:", err);
+      res.status(500).json({ error: "Failed to create subscription checkout session" });
     }
+  }
+);
 
-    const locDoc = locSnap.docs[0];
-    const locationId = locDoc.id;
-    const locData = locDoc.data() || {};
+/**
+ * POST /api/payments/one-time
+ */
+router.post(
+  "/one-time",
+  protect,
+  [body("priceId", "priceId is required").notEmpty()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const autoAcceptGuests =
-      typeof locData.autoAcceptGuests === "boolean" ? locData.autoAcceptGuests : true;
-
-    // Grace seconds remaining
-    let graceSecondsRemaining = locData.graceUntil ? secondsRemaining(locData.graceUntil) : null;
-
-    // If grace ended and auto-accept ON, promote next (transaction lock)
-    if (autoAcceptGuests) {
-      const graceUntilMs = toMillis(locData.graceUntil);
-      const graceActive = graceUntilMs && graceUntilMs > Date.now();
-      if (!graceActive) {
-        await promoteNextVisitTransactional(locationId);
-        const freshLoc = await locationsCol.doc(locationId).get();
-        const fresh = freshLoc.exists ? freshLoc.data() : {};
-        graceSecondsRemaining = fresh?.graceUntil ? secondsRemaining(fresh.graceUntil) : null;
-      }
+    try {
+      const { priceId } = req.body;
+      const session = await payments.createCheckoutSession({
+        priceId,
+        mode: "payment",
+        user: req.user,
+      });
+      res.json({ sessionId: session.id, url: session.url });
+    } catch (err) {
+      console.error("one-time checkout error:", err);
+      res.status(500).json({ error: "Failed to create one-time checkout session" });
     }
-
-    const now = new Date();
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
-    const endOfToday = new Date(now);
-    endOfToday.setHours(23, 59, 59, 999);
-
-    const startTs = admin.firestore.Timestamp.fromDate(startOfToday);
-    const endTs = admin.firestore.Timestamp.fromDate(endOfToday);
-
-    // Requested today (requested/pending)
-    const requestedSnap = await guestVisitsCol
-      .where("locationId", "==", locationId)
-      .where("status", "in", ["requested", "pending"])
-      .where("createdAt", ">=", startTs)
-      .where("createdAt", "<=", endTs)
-      .orderBy("createdAt", "asc")
-      .get();
-
-    // Active now
-    const activeSnap = await guestVisitsCol
-      .where("locationId", "==", locationId)
-      .where("status", "==", "active")
-      .get();
-
-    const requestedGuests = requestedSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const activeGuests = activeSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-    // ✅ Fix: totalGuestsToday counts ALL visits created today (any status)
-    const todayAllSnap = await guestVisitsCol
-      .where("locationId", "==", locationId)
-      .where("createdAt", ">=", startTs)
-      .where("createdAt", "<=", endTs)
-      .get();
-
-    // Weekly traffic (last 7 days)
-    const sevenDaysAgo = new Date(now);
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
-    sevenDaysAgo.setHours(0, 0, 0, 0);
-    const sevenDaysTs = admin.firestore.Timestamp.fromDate(sevenDaysAgo);
-
-    const weeklySnap = await guestVisitsCol
-      .where("locationId", "==", locationId)
-      .where("createdAt", ">=", sevenDaysTs)
-      .get();
-
-      const DAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-
-    const trafficByDay = new Array(7).fill(0);
-
-    weeklySnap.forEach((doc) => {
-      const data = doc.data();
-      const raw = data.createdAt;
-      if (!raw || typeof raw.toDate !== "function") return;
-      const createdAt = raw.toDate();
-      const jsDay = createdAt.getDay(); // 0=Sun..6=Sat
-      const index = (jsDay + 6) % 7; // 0=Mon..6=Sun
-      trafficByDay[index] += 1;
-    });
-
-    const weeklyTraffic = trafficByDay.map((count, index) => ({
-      day: DAY_LABELS[index],
-      value: count,
-    }));
-
-    const stats = {
-      activeGuests: activeGuests.length,
-      totalGuestsToday: todayAllSnap.size,
-    };
-
-    return res.json({
-      stats,
-      requestedGuests,
-      activeGuests,
-      weeklyTraffic,
-      autoAcceptGuests,
-      graceSecondsRemaining,
-      locationId,
-    });
-  } catch (err) {
-    console.error("GET /partner/analytics error:", err);
-    return res.status(500).json({ error: "Server error" });
   }
-});
+);
 
 /**
- * POST /api/partner/guests/:visitId/accept
- * Manual accept -> sets active + sets location lock
+ * POST /api/payments/guest/checkout
  */
-partnerRouter.post("/guests/:visitId/accept", protect, async (req, res) => {
-  try {
-    const userId = req.user.userId || req.user.id;
-    const { visitId } = req.params;
-
-    const visitRef = guestVisitsCol.doc(visitId);
-
-    await firestore.runTransaction(async (tx) => {
-      const visitSnap = await tx.get(visitRef);
-      if (!visitSnap.exists) throw new Error("VISIT_NOT_FOUND");
-
-      const visit = visitSnap.data() || {};
-      const locationId = visit.locationId;
-      if (!locationId) throw new Error("VISIT_NO_LOCATION");
-
-      const locRef = locationsCol.doc(locationId);
-      const locSnap = await tx.get(locRef);
-      if (!locSnap.exists) throw new Error("LOCATION_NOT_FOUND");
-
-      const loc = locSnap.data() || {};
-      if (loc.owner !== userId) throw new Error("NOT_ALLOWED");
-
-      if (!["requested", "pending"].includes(visit.status)) throw new Error("NOT_PENDING");
-
-      // grace block
-      const graceUntilMs = toMillis(loc.graceEndsAt);
-
-      if (graceUntilMs && Date.now() < graceUntilMs) throw new Error("IN_GRACE");
-
-      // lock block (avoid double active)
-      if (loc.currentActiveVisitId) throw new Error("ALREADY_ACTIVE");
-
-      const nowTs = admin.firestore.Timestamp.now();
-      const maxDurationMinutes = Number(visit.maxDurationMinutes || 8);
-      const expiresAt = admin.firestore.Timestamp.fromMillis(
-        nowTs.toMillis() + maxDurationMinutes * 60 * 1000
-      );
-
-      tx.set(
-        visitRef,
-        {
-          status: "active",
-          startTime: nowTs,
-          expiresAt,
-          accessCode: loc.accessCode || visit.accessCode || null,
-          instructions: loc.instructions || visit.instructions || null,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      tx.set(
-        locRef,
-        { currentActiveVisitId: visitId, updatedAt: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-    });
-
-    return res.json({ id: visitId, status: "active" });
-  } catch (err) {
-    const msg = err?.message || "";
-    if (msg === "VISIT_NOT_FOUND") return res.status(404).json({ error: "Visit not found" });
-    if (msg === "LOCATION_NOT_FOUND") return res.status(404).json({ error: "Location not found" });
-    if (msg === "NOT_ALLOWED") return res.status(403).json({ error: "Not allowed" });
-    if (msg === "NOT_PENDING") return res.status(400).json({ error: "Visit is not pending" });
-    if (msg === "IN_GRACE") return res.status(409).json({ error: "Location is in grace period" });
-    if (msg === "ALREADY_ACTIVE")
-      return res.status(409).json({ error: "A guest is already active for this location" });
-
-    console.error("POST /partner/guests/:visitId/accept error:", err);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
-
-/**
- * POST /api/partner/guests/:visitId/end
- * Ends active visit -> clears lock + starts grace
- */
-partnerRouter.post("/guests/:visitId/end", protect, async (req, res) => {
-  try {
-    const userId = req.user.userId || req.user.id;
-    const { visitId } = req.params;
-
-    const visitRef = guestVisitsCol.doc(visitId);
-
-    const result = await firestore.runTransaction(async (tx) => {
-      const visitSnap = await tx.get(visitRef);
-      if (!visitSnap.exists) throw new Error("VISIT_NOT_FOUND");
-      const visit = visitSnap.data() || {};
-
-      const locationId = visit.locationId;
-      if (!locationId) throw new Error("VISIT_NO_LOCATION");
-
-      const locRef = locationsCol.doc(locationId);
-      const locSnap = await tx.get(locRef);
-      if (!locSnap.exists) throw new Error("LOCATION_NOT_FOUND");
-
-      const loc = locSnap.data() || {};
-      if (loc.owner !== userId) throw new Error("NOT_ALLOWED");
-      if (visit.status !== "active") throw new Error("NOT_ACTIVE");
-
-      const nowTs = admin.firestore.Timestamp.now();
-      const graceUntil = admin.firestore.Timestamp.fromMillis(
-        nowTs.toMillis() + GRACE_SECONDS * 1000
-      );
-
-      tx.set(
-        visitRef,
-        {
-          status: "completed",
-          endTime: nowTs,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      // clear active lock if pointing to this visit
-      const updates = {
-        graceUntil,
-        updatedAt: FieldValue.serverTimestamp(),
-      };
-      if (loc.currentActiveVisitId === visitId) {
-        updates.currentActiveVisitId = null;
-      }
-      tx.set(locRef, updates, { merge: true });
-
-      return { graceSecondsRemaining: GRACE_SECONDS };
-    });
-
-    return res.json({
-      id: visitId,
-      status: "completed",
-      graceSecondsRemaining: result.graceSecondsRemaining,
-    });
-  } catch (err) {
-    const msg = err?.message || "";
-    if (msg === "VISIT_NOT_FOUND") return res.status(404).json({ error: "Visit not found" });
-    if (msg === "LOCATION_NOT_FOUND") return res.status(404).json({ error: "Location not found" });
-    if (msg === "NOT_ALLOWED") return res.status(403).json({ error: "Not allowed" });
-    if (msg === "NOT_ACTIVE")
-      return res.status(400).json({ error: "Visit is not currently active" });
-
-    console.error("POST /partner/guests/:visitId/end error:", err);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
-
-/**
- * PUT /api/partner/location
- */
-partnerRouter.put(
-  "/location",
+router.post(
+  "/guest/checkout",
   protect,
   [
+    body("locationId", "locationId is required").notEmpty(),
+    body("price", "price must be a positive number").isFloat({ min: 0.5 }),
     body("name").optional().isString(),
-    body("address").optional().isString(),
-    body("accessCode").optional().isString(),
-    body("price").optional().isFloat({ min: 0 }),
-    body("description").optional().isString(),
-    body("features").optional().isArray(),
-    body("photos").optional().isArray(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     try {
-      const userId = req.user.userId || req.user.id;
-      const {
-        name,
-        address,
-        accessCode,
-        price = 0,
-        description = "",
-        features = [],
-        photos = [],
-      } = req.body;
+      const { locationId, price, name } = req.body;
+      const userId = req.user.id || req.user.userId;
+      const email = req.user.email;
 
-      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
+      if (!userId) return res.status(400).json({ error: "Missing user id" });
 
-      let locRef;
-      let existing = {};
-      if (snap.empty) {
-        locRef = locationsCol.doc();
-      } else {
-        locRef = snap.docs[0].ref;
-        existing = snap.docs[0].data() || {};
+      const locSnap = await locationsCol.doc(locationId).get();
+      if (!locSnap.exists) return res.status(404).json({ error: "Location not found" });
+      const loc = locSnap.data() || {};
+
+      const partnerId = loc.owner || null;
+      if (!partnerId) return res.status(400).json({ error: "Location missing owner/partner" });
+
+      const partnerSnap = await partnersCol.doc(partnerId).get();
+      const partner = partnerSnap.exists ? partnerSnap.data() : {};
+      const destinationAccountId = partner.stripeAccountId || null;
+
+      if (!destinationAccountId) {
+        return res.status(400).json({
+          error: "Partner is not connected to Stripe yet. Complete onboarding first.",
+        });
       }
 
-      const addressChanged =
-        typeof address === "string" &&
-        address.trim() &&
-        address.trim() !== (existing.address || "").trim();
+      const unitAmount = Math.round(Number(price) * 100);
+      const applicationFeeAmount = Math.round(unitAmount * 0.30); // 30% platform fee
 
-      let coordinates = existing.coordinates || null;
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        customer_email: email || undefined,
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: { name: name || `Bathroom pass - ${loc.name || "location"}` },
+              unit_amount: unitAmount,
+            },
+            quantity: 1,
+          },
+        ],
 
-      if (addressChanged || !coordinates) {
-        const geo = await geocodeAddress(address || existing.address);
-        if (geo) coordinates = geo;
-      }
+        // ✅ This is the entire Connect fix:
+        payment_intent_data: {
+          application_fee_amount: applicationFeeAmount,
+          transfer_data: {
+            destination: destinationAccountId,
+          },
+        },
 
-      const update = {
-        owner: userId,
-        name: name !== undefined ? name : existing.name,
-        address: address !== undefined ? address : existing.address,
-        accessCode: accessCode !== undefined ? accessCode : existing.accessCode || "",
-        price: Number(price),
-        description,
-        amenities: Array.isArray(features) ? features : [],
-        photos: Array.isArray(photos) ? photos : [],
-        coordinates: coordinates || existing.coordinates || null,
-        isActive: existing.isActive !== undefined ? existing.isActive : true,
-        updatedAt: FieldValue.serverTimestamp(),
-      };
+        metadata: { locationId, userId, partnerId, destinationAccountId },
 
-      await locRef.set(update, { merge: true });
-      const updatedSnap = await locRef.get();
-      const loc = updatedSnap.data() || {};
+        success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL}/#/home`,
+      });
 
-      return res.json({ id: locRef.id, location: loc });
+      return res.json({ sessionId: session.id, url: session.url });
     } catch (err) {
-      console.error("PUT /partner/location error:", err);
-      return res.status(500).json({ error: "Server error" });
+      console.error("guest checkout error:", err);
+      return res.status(500).json({ error: err.message || "Failed to create guest checkout session" });
     }
   }
 );
 
+
 /**
- * POST /api/partner/onboard-link
+ * GET /api/payments/guest/session/:sessionId
+ *
+ * NOT protected (Stripe redirect / in-app browser may not have JWT)
+ * Returns:
+ * { session, location, visit, queuePosition, guestsAhead, graceSecondsRemaining }
  */
-partnerRouter.post("/onboard-link", protect, async (req, res) => {
+router.get("/guest/session/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
+
   try {
-    const userId = req.user.userId || req.user.id;
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent"],
+    });
+    if (!session) return res.status(404).json({ error: "Session not found" });
 
-    let email = req.body.email;
-    if (!email) {
-      const userDoc = await usersCol.doc(userId).get();
-      email = userDoc.exists ? userDoc.data().email : null;
-    }
-    if (!email) return res.status(400).json({ error: "Email required" });
+    const metadata = session.metadata || {};
+    const locationId = metadata.locationId;
+    const userId = metadata.userId || null;
 
-    const partnerRef = partnersCol.doc(userId);
-    const partnerSnap = await partnerRef.get();
-    const partnerData = partnerSnap.exists ? partnerSnap.data() : {};
-    let { stripeAccountId } = partnerData;
-
-    if (!stripeAccountId) {
-      const account = await stripeService.createPartnerAccount(userId, email, req.body || {});
-      stripeAccountId = account.id;
-      await partnerRef.set(
-        { stripeAccountId, onboardingStatus: "pending_verification" },
-        { merge: true }
-      );
+    if (!locationId) {
+      return res.status(400).json({ error: "Session metadata missing locationId" });
     }
 
-    const FRONTEND_URL = process.env.FRONTEND_URL || "https://pay2pee.app";
-    const returnUrl = `${FRONTEND_URL}/partner`;
-    const refreshUrl = `${FRONTEND_URL}/partner`;
+    const locRef = locationsCol.doc(locationId);
+    const locSnap = await locRef.get();
+    if (!locSnap.exists) {
+      return res.status(404).json({ error: "Location not found for this pass" });
+    }
 
-    const link = await stripeService.createAccountOnboardingLink(
-      stripeAccountId,
-      returnUrl,
-      refreshUrl
-    );
+    const location = { id: locSnap.id, ...locSnap.data() };
+    const autoAcceptGuests = !!location.autoAcceptGuests;
+    const partnerId = location.owner || null;
 
-    return res.json({ url: link.url, frontendUrl: FRONTEND_URL });
+    // Prefer deterministic doc id (prevents double-creation races)
+    const deterministicVisitRef = guestVisitsCol.doc(session.id);
+    const deterministicSnap = await deterministicVisitRef.get();
+
+    // Back-compat: old systems may have random doc ids with stripeSessionId field
+    let visitDoc = null;
+
+    const maybeExpireVisit = async (docId, data) => {
+      if (
+        data.status === "active" &&
+        data.expiresAt &&
+        typeof data.expiresAt.toDate === "function"
+      ) {
+        const expDate = data.expiresAt.toDate();
+        if (new Date() > expDate) {
+          await firestore.runTransaction(async (tx) => {
+            const vRef = guestVisitsCol.doc(docId);
+            const lRef = locationsCol.doc(data.locationId);
+
+            const [vSnap, lSnap] = await Promise.all([tx.get(vRef), tx.get(lRef)]);
+            if (!vSnap.exists || !lSnap.exists) return;
+
+            const lData = lSnap.data() || {};
+
+            tx.set(
+              vRef,
+              {
+                status: "expired",
+                endTime: admin.firestore.Timestamp.fromDate(expDate),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+
+            // clear active lock if it points to this visit
+            if (lData.currentActiveVisitId === docId) {
+              tx.set(
+                lRef,
+                { currentActiveVisitId: null },
+                { merge: true }
+              );
+            }
+
+            // start grace
+            await setGraceWindow(data.locationId, tx);
+          });
+
+          return {
+            ...data,
+            status: "expired",
+            endTime: admin.firestore.Timestamp.fromDate(expDate),
+          };
+        }
+      }
+      return data;
+    };
+
+    if (deterministicSnap.exists) {
+      let data = deterministicSnap.data() || {};
+      data = await maybeExpireVisit(deterministicSnap.id, data);
+      visitDoc = { id: deterministicSnap.id, ...data };
+    } else {
+      // back-compat lookup
+      const existingVisitSnap = await guestVisitsCol
+        .where("stripeSessionId", "==", session.id)
+        .limit(1)
+        .get();
+
+      if (!existingVisitSnap.empty) {
+        const doc = existingVisitSnap.docs[0];
+        let data = doc.data() || {};
+        data = await maybeExpireVisit(doc.id, data);
+        visitDoc = { id: doc.id, ...data };
+      }
+    }
+
+    // If no visit yet, only create if paid
+    if (!visitDoc) {
+      const isPaid =
+        session.payment_status === "paid" ||
+        session.payment_status === "no_payment_required";
+
+      const graceInfo = await computeGrace(locationId);
+
+      if (!isPaid) {
+        return res.json({
+          session: {
+            id: session.id,
+            status: session.payment_status,
+            amountTotal: session.amount_total,
+            currency: session.currency,
+          },
+          location,
+          visit: null,
+          queuePosition: null,
+          guestsAhead: null,
+          graceSecondsRemaining: graceInfo.graceSecondsRemaining,
+        });
+      }
+
+      const maxDurationMinutes = 8;
+      const now = admin.firestore.Timestamp.now();
+
+      // Transaction: location lock prevents race
+      await firestore.runTransaction(async (tx) => {
+        const locLive = await tx.get(locRef);
+        if (!locLive.exists) throw new Error("Location missing");
+
+        const locData = locLive.data() || {};
+        const graceUntilMs = toMillis(locData.graceUntil);
+        const graceActive = graceUntilMs && graceUntilMs > Date.now();
+
+        const canStartNow =
+          !!locData.autoAcceptGuests &&
+          !locData.currentActiveVisitId &&
+          !graceActive;
+
+        const status = canStartNow ? "active" : "requested";
+
+        const startTime = canStartNow ? now : null;
+        const expiresAt = canStartNow
+          ? admin.firestore.Timestamp.fromMillis(now.toMillis() + maxDurationMinutes * 60 * 1000)
+          : null;
+
+        const visitData = {
+          stripeSessionId: session.id,
+          userId,
+          locationId,
+          partnerId,
+          status,
+          amountTotal: session.amount_total,
+          currency: session.currency,
+
+          startTime,
+          endTime: null,
+          maxDurationMinutes,
+          expiresAt,
+
+          accessCode: canStartNow ? locData.accessCode || null : null,
+          instructions: canStartNow ? locData.instructions || null : null,
+
+          dayOfWeek: ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date().getDay()],
+          passType: "one-time",
+
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        tx.set(deterministicVisitRef, visitData, { merge: true });
+
+        if (canStartNow) {
+          tx.set(
+            locRef,
+            { currentActiveVisitId: deterministicVisitRef.id },
+            { merge: true }
+          );
+        }
+      });
+
+      const createdSnap = await deterministicVisitRef.get();
+      visitDoc = { id: createdSnap.id, ...(createdSnap.data() || {}) };
+
+      // Notifications (non-transactional)
+      try {
+        if (userId) {
+          await createNotification({
+            userId,
+            userType: "guest",
+            type: "GUEST_BOOKING_CONFIRMED",
+            title: "Bathroom booked",
+            body: `Your visit to ${location.name || "this bathroom"} is confirmed.`,
+            data: { guestVisitId: visitDoc.id, locationId },
+          });
+
+          await createNotification({
+            userId,
+            userType: "guest",
+            type: "GUEST_TIME_WARNING",
+            title: "Time almost up",
+            body: `Your visit to ${location.name || "this bathroom"} is almost over.`,
+            data: { guestVisitId: visitDoc.id, locationId, expiresAt: visitDoc.expiresAt || null },
+          });
+        }
+
+        if (partnerId) {
+          await createNotification({
+            userId: partnerId,
+            userType: "partner",
+            type: "PARTNER_NEW_BOOKING",
+            title: "New booking",
+            body: "A guest just booked your bathroom.",
+            data: { guestVisitId: visitDoc.id, locationId },
+          });
+        }
+      } catch (notifyErr) {
+        console.error("Error creating booking notifications:", notifyErr);
+      }
+    }
+
+    // Compute queue info for MyPass
+    let queuePosition = null;
+    let guestsAhead = null;
+
+    try {
+      if (visitDoc?.locationId) {
+        const queueSnap = await guestVisitsCol
+          .where("locationId", "==", visitDoc.locationId)
+          .where("status", "in", ["requested", "pending", "active"])
+          .orderBy("createdAt", "asc")
+          .get();
+
+        const queue = queueSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const idx = queue.findIndex((v) => v.id === visitDoc.id);
+
+        if (idx !== -1) {
+          queuePosition = idx + 1;
+          guestsAhead = idx;
+        }
+      }
+    } catch (queueErr) {
+      console.error("Error computing queue for visit:", queueErr);
+    }
+
+    const graceInfo = await computeGrace(locationId);
+
+    // Opportunistic promote (only if grace is NOT active and no active lock)
+    // This helps in edge cases where partner screen isn't open.
+    await maybePromoteNextQueuedTransactional(locationId);
+
+    return res.json({
+      session: {
+        id: session.id,
+        status: session.payment_status,
+        amountTotal: session.amount_total,
+        currency: session.currency,
+      },
+      location,
+      visit: visitDoc,
+      queuePosition,
+      guestsAhead,
+      graceSecondsRemaining: graceInfo.graceSecondsRemaining,
+    });
   } catch (err) {
-    console.error("POST /partner/onboard-link error:", err);
-    return res.status(500).json({ error: err.message || "Stripe onboarding link error" });
+    console.error("guest session lookup error:", err);
+    return res.status(500).json({ error: err.message || "Failed to load session / pass details" });
   }
 });
 
-// ------------------------------
-// Host router -> /api/host/*
-// ------------------------------
-const hostRouter = express.Router();
-
 /**
- * PUT /api/host/visibility
+ * POST /api/payments/guest/visit/:visitId/end
+ * Guest ends an active visit -> starts grace window + clears active lock
  */
-hostRouter.put(
-  "/visibility",
-  protect,
-  [body("isActive").isBoolean()],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+router.post("/guest/visit/:visitId/end", protect, async (req, res) => {
+  const { visitId } = req.params;
+  const userId = req.user.id || req.user.userId;
 
-    try {
-      const userId = req.user.userId || req.user.id;
-      const { isActive } = req.body;
+  try {
+    const visitRef = guestVisitsCol.doc(visitId);
+    const snap = await visitRef.get();
+    if (!snap.exists) return res.status(404).json({ error: "Visit not found" });
 
-      const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
-      if (snap.empty) return res.status(404).json({ error: "Location not found" });
-
-      const locRef = snap.docs[0].ref;
-      await locRef.set({ isActive, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-
-      return res.json({ success: true, isActive });
-    } catch (err) {
-      console.error("PUT /host/visibility error:", err);
-      return res.status(500).json({ error: "Server error" });
+    const visit = snap.data() || {};
+    if (visit.userId !== userId) {
+      return res.status(403).json({ error: "You are not allowed to end this visit" });
     }
-  }
-);
 
-/**
- * ✅ FIXED: PUT /api/host/auto-accept
- * - locationId is OPTIONAL (backend will infer by owner)
- * Body: { autoAcceptGuests, locationId? }
- */
-hostRouter.put(
-  "/auto-accept",
-  protect,
-  [body("autoAcceptGuests").isBoolean().withMessage("autoAcceptGuests must be true or false")],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+    if (visit.status !== "active") {
+      return res.status(400).json({ error: "Visit is not active" });
+    }
 
-    try {
-      const userId = req.user.userId || req.user.id;
-      const { locationId, autoAcceptGuests } = req.body;
+    const now = admin.firestore.Timestamp.now();
 
-      let ref;
+    await firestore.runTransaction(async (tx) => {
+      const vSnap = await tx.get(visitRef);
+      if (!vSnap.exists) throw new Error("Visit missing");
+      const vData = vSnap.data() || {};
 
-      if (locationId) {
-        ref = locationsCol.doc(locationId);
-        const snap = await ref.get();
-        if (!snap.exists) return res.status(404).json({ error: "Location not found" });
+      const locId = vData.locationId;
+      const locRef = locId ? locationsCol.doc(locId) : null;
+      const locSnap = locRef ? await tx.get(locRef) : null;
+      const locData = locSnap?.exists ? locSnap.data() : null;
 
-        const loc = snap.data() || {};
-        if (loc.owner !== userId) {
-          return res.status(403).json({ error: "You are not allowed to update this location" });
+      tx.set(
+        visitRef,
+        {
+          status: "completed",
+          endTime: now,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (locRef && locData) {
+        // clear lock if it points to this visit
+        if (locData.currentActiveVisitId === visitId) {
+          tx.set(locRef, { currentActiveVisitId: null }, { merge: true });
         }
-      } else {
-        const snap = await locationsCol.where("owner", "==", userId).limit(1).get();
-        if (snap.empty) return res.status(404).json({ error: "Location not found" });
-        ref = snap.docs[0].ref;
+        await setGraceWindow(locId, tx);
       }
+    });
 
-      await ref.set({ autoAcceptGuests, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-
-      const updated = await ref.get();
-      const updatedLoc = updated.data() || {};
-      return res.json({ id: ref.id, autoAcceptGuests: !!updatedLoc.autoAcceptGuests });
-    } catch (err) {
-      console.error("PUT /host/auto-accept error:", err);
-      return res.status(500).json({ error: "Server error" });
-    }
-  }
-);
-
-/**
- * POST /api/host/payout
- */
-hostRouter.post(
-  "/payout",
-  protect,
-  [body("amountRequested").isFloat({ min: 5 })],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
+    // Thank-you notification
     try {
-      const partnerId = req.user.userId || req.user.id;
-      const amount = Number(req.body.amountRequested);
-
-      const transfer = await stripeService.initiateManualPayout(partnerId, amount);
-
-      const doc = await partnersCol.doc(partnerId).get();
-      const pdata = doc.exists ? doc.data() : {};
-
-      return res.json({
-        success: true,
-        transferId: transfer.id,
-        newBalance: Number(pdata.pendingPayout || 0),
-        lastPayoutDate: pdata.lastPayoutDate || new Date().toISOString(),
+      await createNotification({
+        userId,
+        userType: "guest",
+        type: "GUEST_THANK_YOU",
+        title: "Thanks for your visit",
+        body: "Thanks for using Pay2Pee today.",
+        data: { guestVisitId: visitId, locationId: visit.locationId || null },
       });
-    } catch (err) {
-      console.error("POST /host/payout error:", err);
-      return res.status(500).json({ error: err.message || "Stripe error" });
+    } catch (notifyErr) {
+      console.error("Error creating thank-you notification:", notifyErr);
     }
-  }
-);
 
-module.exports = { partnerRouter, hostRouter };
+    const graceInfo = await computeGrace(visit.locationId);
+
+    return res.json({
+      id: visitId,
+      status: "completed",
+      endTime: now,
+      graceSecondsRemaining: graceInfo.graceSecondsRemaining ?? GRACE_SECONDS,
+    });
+  } catch (err) {
+    console.error("End visit error:", err);
+    return res.status(500).json({ error: err.message || "Failed to end visit" });
+  }
+});
+
+module.exports = router;

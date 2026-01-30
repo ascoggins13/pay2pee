@@ -14,6 +14,7 @@ const locationsCol = firestore.collection("locations");
 const partnersCol = firestore.collection("partners");
 
 // ------------------------------
+// ------------------------------
 // Queue + Grace Period Helpers
 // ------------------------------
 const GRACE_SECONDS = 180;
@@ -31,39 +32,37 @@ function toMillis(ts) {
 }
 
 async function computeGrace(locationId) {
-  if (!locationId) return { graceUntil: null, graceSecondsRemaining: null };
+  if (!locationId) return { graceEndsAt: null, graceSecondsRemaining: null };
+
   const locSnap = await locationsCol.doc(locationId).get();
-  if (!locSnap.exists) return { graceUntil: null, graceSecondsRemaining: null };
+  if (!locSnap.exists) return { graceEndsAt: null, graceSecondsRemaining: null };
 
-  const graceUntil = locSnap.data()?.graceUntil || null;
-  const graceUntilMs = toMillis(graceUntil);
-  if (!graceUntilMs) return { graceUntil: null, graceSecondsRemaining: null };
+  const graceEndsAt = locSnap.data()?.graceEndsAt || null;
+  const graceMs = toMillis(graceEndsAt);
+  if (!graceMs) return { graceEndsAt: null, graceSecondsRemaining: null };
 
-  const remaining = Math.max(0, Math.ceil((graceUntilMs - Date.now()) / 1000));
-  return { graceUntil, graceSecondsRemaining: remaining };
+  const remaining = Math.max(0, Math.ceil((graceMs - Date.now()) / 1000));
+  return { graceEndsAt, graceSecondsRemaining: remaining };
 }
 
 async function setGraceWindow(locationId, tx) {
   if (!locationId) return null;
-  const graceUntil = admin.firestore.Timestamp.fromMillis(
+
+  const graceEndsAt = admin.firestore.Timestamp.fromMillis(
     Date.now() + GRACE_SECONDS * 1000
   );
+
   const ref = locationsCol.doc(locationId);
 
-  if (tx) {
-    tx.set(
-      ref,
-      { graceUntil, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-  } else {
-    await ref.set(
-      { graceUntil, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-  }
+  const payload = {
+    graceEndsAt,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
 
-  return graceUntil;
+  if (tx) tx.set(ref, payload, { merge: true });
+  else await ref.set(payload, { merge: true });
+
+  return graceEndsAt;
 }
 
 async function maybePromoteNextQueuedTransactional(locationId) {
@@ -82,8 +81,8 @@ async function maybePromoteNextQueuedTransactional(locationId) {
     if (loc.currentActiveVisitId) return null;
 
     // respect grace
-    const graceUntilMs = toMillis(loc.graceUntil);
-    if (graceUntilMs && graceUntilMs > Date.now()) return null;
+    const graceMs = toMillis(loc.graceEndsAt);
+    if (graceMs && graceMs > Date.now()) return null;
 
     // find oldest queued (requested/pending)
     const q = guestVisitsCol
@@ -421,8 +420,8 @@ router.get("/guest/session/:sessionId", async (req, res) => {
         if (!locLive.exists) throw new Error("Location missing");
 
         const locData = locLive.data() || {};
-        const graceUntilMs = toMillis(locData.graceUntil);
-        const graceActive = graceUntilMs && graceUntilMs > Date.now();
+        const graceMs = toMillis(locData.graceEndsAt);
+          const graceActive = graceMs && graceMs > Date.now();;
 
         const canStartNow =
           !!locData.autoAcceptGuests &&
