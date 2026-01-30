@@ -641,4 +641,4 @@ router.post("/guest/visit/:visitId/end", protect, async (req, res) => {
   }
 });
 
-module.exports = router;
+module.exports = { partnerRouter, hostRouter };
