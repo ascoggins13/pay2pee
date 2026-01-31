@@ -369,8 +369,48 @@ partnerRouter.get("/analytics", protect, async (req, res) => {
       .where("status", "==", "active")
       .get();
 
-    const requestedGuests = requestedSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const activeGuests = activeSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const requestedGuestsRaw = requestedSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const activeGuestsRaw = activeSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      
+      // ✅ Attach guest identity (name + avatar) from users collection
+      const all = [...requestedGuestsRaw, ...activeGuestsRaw];
+      
+      // collect unique userIds
+      const userIds = Array.from(
+        new Set(
+          all
+            .map((v) => v.userId)
+            .filter((id) => typeof id === "string" && id.length > 0)
+        )
+      );
+      
+      // batch fetch users
+      let userMap = {};
+      if (userIds.length > 0) {
+        const userSnaps = await Promise.all(userIds.map((uid) => usersCol.doc(uid).get()));
+        userSnaps.forEach((snap) => {
+          if (!snap.exists) return;
+          const u = snap.data() || {};
+          const name =
+            u.name ||
+            (u.email ? u.email.split("@")[0] : null) ||
+            "Guest";
+          const avatarUrl = u.avatarUrl || "";
+          userMap[snap.id] = { name, avatarUrl };
+        });
+      }
+      
+      const attachIdentity = (v) => {
+        const u = v.userId ? userMap[v.userId] : null;
+        return {
+          ...v,
+          guestName: u?.name || "Guest",
+          guestAvatarUrl: u?.avatarUrl || "",
+        };
+      };
+      
+      const requestedGuests = requestedGuestsRaw.map(attachIdentity);
+      const activeGuests = activeGuestsRaw.map(attachIdentity);
 
     const todayAllSnap = await guestVisitsCol
       .where("locationId", "==", locationId)
