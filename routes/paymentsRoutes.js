@@ -567,39 +567,53 @@ router.get("/guest/visit/current", protect, async (req, res) => {
     const userId = req.user.id || req.user.userId;
     if (!userId) return res.status(400).json({ error: "Missing user id" });
 
-    const snap = await guestVisitsCol
+    // Index-free approach: pull recent visits for this user, then filter in memory.
+    const baseSnap = await guestVisitsCol
       .where("userId", "==", userId)
-      .where("status", "in", ["active", "requested", "pending"])
       .orderBy("createdAt", "desc")
-      .limit(1)
+      .limit(25)
       .get();
 
-    if (snap.empty) return res.json({ visit: null });
+    if (baseSnap.empty) return res.json({ visit: null });
 
-    const doc = snap.docs[0];
-    const v = doc.data() || {};
+    const allowed = new Set(["active", "requested", "pending"]);
+    let bestDoc = null;
+    let bestData = null;
+
+    for (const doc of baseSnap.docs) {
+      const v = doc.data() || {};
+      if (allowed.has(v.status)) {
+        bestDoc = doc;
+        bestData = v;
+        break;
+      }
+    }
+
+    if (!bestDoc) return res.json({ visit: null });
 
     // optional: location name/address for UI convenience
     let loc = null;
-    if (v.locationId) {
-      const locSnap = await locationsCol.doc(v.locationId).get();
+    if (bestData.locationId) {
+      const locSnap = await locationsCol.doc(bestData.locationId).get();
       if (locSnap.exists) loc = locSnap.data() || {};
     }
 
+    const grace = await computeGrace(bestData.locationId);
+
     return res.json({
       visit: {
-        id: doc.id,
-        ...v,
+        id: bestDoc.id,
+        ...bestData,
         locationName: loc?.name || null,
         locationAddress: loc?.address || null,
         queuePosition: null,
         guestsAhead: null,
-        graceSecondsRemaining: (await computeGrace(v.locationId)).graceSecondsRemaining,
+        graceSecondsRemaining: grace.graceSecondsRemaining,
       },
     });
   } catch (err) {
     console.error("GET /payments/guest/visit/current error:", err);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: err.message || "Server error" });
   }
 });
 /**
