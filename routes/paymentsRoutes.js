@@ -558,7 +558,50 @@ router.get("/guest/session/:sessionId", async (req, res) => {
     return res.status(500).json({ error: err.message || "Failed to load session / pass details" });
   }
 });
+/**
+ * GET /api/payments/guest/visit/current
+ * Protected: returns the user's most relevant current visit (active/requested/pending)
+ */
+router.get("/guest/visit/current", protect, async (req, res) => {
+  try {
+    const userId = req.user.id || req.user.userId;
+    if (!userId) return res.status(400).json({ error: "Missing user id" });
 
+    const snap = await guestVisitsCol
+      .where("userId", "==", userId)
+      .where("status", "in", ["active", "requested", "pending"])
+      .orderBy("createdAt", "desc")
+      .limit(1)
+      .get();
+
+    if (snap.empty) return res.json({ visit: null });
+
+    const doc = snap.docs[0];
+    const v = doc.data() || {};
+
+    // optional: location name/address for UI convenience
+    let loc = null;
+    if (v.locationId) {
+      const locSnap = await locationsCol.doc(v.locationId).get();
+      if (locSnap.exists) loc = locSnap.data() || {};
+    }
+
+    return res.json({
+      visit: {
+        id: doc.id,
+        ...v,
+        locationName: loc?.name || null,
+        locationAddress: loc?.address || null,
+        queuePosition: null,
+        guestsAhead: null,
+        graceSecondsRemaining: (await computeGrace(v.locationId)).graceSecondsRemaining,
+      },
+    });
+  } catch (err) {
+    console.error("GET /payments/guest/visit/current error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
 /**
  * POST /api/payments/guest/visit/:visitId/end
  * Guest ends an active visit -> starts grace window + clears active lock
