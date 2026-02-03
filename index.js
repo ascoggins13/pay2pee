@@ -27,6 +27,10 @@ app.set('trust proxy', 1); // Render / proxies
 const authRoutes = require('./routes/auth');
 app.use('/api/auth', authRoutes);
 
+// USERS (guest profile)
+const usersRoutes = require("./routes/users");
+app.use("/api/users", usersRoutes);
+
 // LOCATIONS (guest map / nearby)
 const locationRoutes = require('./routes/locationRoutes');
 app.use('/api/locations', locationRoutes);
