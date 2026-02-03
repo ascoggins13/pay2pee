@@ -361,6 +361,63 @@ router.delete('/favorites/:locationId', protect, async (req, res) => {
 router.get('/', (req, res) => {
   res.send('User route: profile, preferences, favorites endpoints are active.');
 });
+/**
+ * PUT /profile
+ *
+ * Saves guest profile fields on the user document:
+ * - name, jobTitle, avatarUrl
+ */
+router.put(
+  "/profile",
+  protect,
+  [
+    body("name").optional().isString().trim().isLength({ min: 1, max: 60 }),
+    body("jobTitle").optional().isString().trim().isLength({ max: 80 }),
+    body("avatarUrl").optional().isString().trim().isLength({ max: 2000 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ errors: errors.array() });
 
+    try {
+      const userId = req.user.userId;
+      const { name, jobTitle, avatarUrl } = req.body || {};
+
+      const update = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if (typeof name === "string") update.name = name;
+      if (typeof jobTitle === "string") update.jobTitle = jobTitle;
+
+      // IMPORTANT: store URL string here (NOT huge base64)
+      if (typeof avatarUrl === "string") update.avatarUrl = avatarUrl;
+
+      await usersCol.doc(userId).set(update, { merge: true });
+
+      // return fresh profile snapshot (simple + helpful)
+      const snap = await usersCol.doc(userId).get();
+      const userData = snap.exists ? snap.data() : {};
+
+      return res.json({
+        userId,
+        name:
+          userData.name ||
+          (userData.email ? userData.email.split("@")[0] : "Guest"),
+        email: userData.email || null,
+        avatarUrl: userData.avatarUrl || "",
+        jobTitle: userData.jobTitle || "",
+        memberSince:
+          userData.memberSince ||
+          (userData.createdAt && tsToIso(userData.createdAt)) ||
+          null,
+      });
+    } catch (err) {
+      console.error("PUT /users/profile error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
 module.exports = router;
 
