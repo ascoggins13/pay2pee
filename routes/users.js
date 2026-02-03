@@ -166,6 +166,8 @@ router.get('/profile', protect, async (req, res) => {
 
     return res.json({
       userId,
+      uid: userId,   // ✅ alias (many clients expect uid)
+      id: userId,    // ✅ alias (some UI expects id)
       name,
       email,
       avatarUrl,
