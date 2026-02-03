@@ -421,5 +421,40 @@ router.put(
     }
   }
 );
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage() });
+
+router.post("/avatar", protect, upload.single("file"), async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    if (!req.file) return res.status(400).json({ error: "Missing file" });
+
+    // firebase-admin storage bucket
+    const bucket = admin.storage().bucket(); // uses default bucket from firebase-admin init
+    const filePath = `users/${userId}/avatar.jpg`;
+
+    const file = bucket.file(filePath);
+
+    await file.save(req.file.buffer, {
+      metadata: { contentType: req.file.mimetype || "image/jpeg" },
+      resumable: false,
+    });
+
+    // Option A: make public (fastest)
+    await file.makePublic();
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${filePath}`;
+
+    // Save URL on user doc
+    await usersCol.doc(userId).set(
+      { avatarUrl: publicUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+
+    return res.json({ avatarUrl: publicUrl, uid: userId, userId });
+  } catch (err) {
+    console.error("POST /users/avatar error:", err);
+    return res.status(500).json({ error: "Avatar upload failed" });
+  }
+});
 module.exports = router;
 
