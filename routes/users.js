@@ -92,74 +92,90 @@ router.get('/profile', protect, async (req, res) => {
     }
 
     // Recent visits from guestVisits collection
-    const visitsSnap = await guestVisitsCol
-      .where('userId', '==', userId) // ✅ was 'guestId'
-      .orderBy('createdAt', 'desc')
-      .limit(10)
-      .get();
+const visitsSnap = await guestVisitsCol
+.where("userId", "==", userId)
+.orderBy("createdAt", "desc")
+.limit(50) // bump to 50 so your cards have more data; change as you like
+.get();
 
-    const recentVisits = [];
-    let totalSpentCents = 0;
+// 1) Collect unique locationIds from visits
+const locationIds = new Set();
+visitsSnap.forEach((doc) => {
+const v = doc.data() || {};
+if (v.locationId) locationIds.add(v.locationId);
+});
 
-    visitsSnap.forEach((doc) => {
-      const v = doc.data() || {};
+// 2) Fetch all those locations in parallel (no async inside forEach)
+const locationMap = {};
+await Promise.all(
+Array.from(locationIds).map(async (locId) => {
+  const locSnap = await locationsCol.doc(locId).get();
+  if (locSnap.exists) locationMap[locId] = locSnap.data() || {};
+})
+);
 
-      let price = null;
+// 3) Build recentVisits now that locationMap is ready
+const recentVisits = [];
+let totalSpentCents = 0;
 
-      // ✅ Prefer Stripe amountTotal (cents)
-      if (typeof v.amountTotal === 'number') {
-        price = v.amountTotal / 100;
-        totalSpentCents += v.amountTotal;
-      } else {
-        // Legacy fields in dollars
-        const rawPrice =
-          typeof v.price === 'number'
-            ? v.price
-            : typeof v.amount === 'number'
-            ? v.amount
-            : null;
+visitsSnap.forEach((doc) => {
+const v = doc.data() || {};
 
-        if (typeof rawPrice === 'number') {
-          price = rawPrice;
-          totalSpentCents += Math.round(rawPrice * 100);
-        }
-      }
+// Price calc (same as before)
+let price = null;
+if (typeof v.amountTotal === "number") {
+  price = v.amountTotal / 100;
+  totalSpentCents += v.amountTotal;
+} else {
+  const rawPrice =
+    typeof v.price === "number"
+      ? v.price
+      : typeof v.amount === "number"
+      ? v.amount
+      : null;
 
-      const reviewRating =
-        typeof v.reviewRating === 'number' ? v.reviewRating : null;
-      const reviewText = typeof v.reviewText === 'string' ? v.reviewText : '';
-
-      let locationData = null;
-
-(async () => {
-  if (v.locationId) {
-    const locSnap = await locationsCol.doc(v.locationId).get();
-    if (locSnap.exists) {
-      locationData = locSnap.data();
-    }
+  if (typeof rawPrice === "number") {
+    price = rawPrice;
+    totalSpentCents += Math.round(rawPrice * 100);
   }
-})();
+}
+
+// Pull matched location doc
+const loc = v.locationId ? (locationMap[v.locationId] || {}) : {};
+
+// Review fields (your current UI expects v.review?.rating / v.review?.text)
+const reviewRating =
+  typeof v.reviewRating === "number" ? v.reviewRating : null;
+const reviewText = typeof v.reviewText === "string" ? v.reviewText : "";
 
 recentVisits.push({
   id: doc.id,
   locationId: v.locationId || null,
 
-  // ✅ Pull best name/address available
+  // ✅ best available name/address (visit fields OR location doc)
   name:
     v.locationName ||
-    locationData?.name ||
+    (v.location && v.location.name) ||
+    loc.name ||
     "Bathroom",
 
   address:
     v.locationAddress ||
-    locationData?.address ||
+    (v.location && v.location.address) ||
+    loc.address ||
+    v.address ||
     "",
 
   date: tsToIso(v.createdAt),
-  price: price,
-  review: reviewText || null,
+  price,
+
+  // ✅ match the shape your frontend is using
+  review:
+    reviewRating || reviewText
+      ? { rating: reviewRating, text: reviewText }
+      : null,
 });
-    });
+});
 
     // Simple "savings" metric: 20% of total spent (you can adjust later)
     const totalSpent = totalSpentCents / 100;
