@@ -129,35 +129,36 @@ router.get('/profile', protect, async (req, res) => {
         typeof v.reviewRating === 'number' ? v.reviewRating : null;
       const reviewText = typeof v.reviewText === 'string' ? v.reviewText : '';
 
-      recentVisits.push({
-        id: doc.id,
-        locationId: v.locationId || null,
-        name:
-          v.locationName ||
-          (v.location && v.location.name) ||
-          'Bathroom visit',
-        address:
-          v.locationAddress ||
-          (v.location && v.location.address) ||
-          v.address ||
-          '',
-        date: tsToIso(v.createdAt),
-        price: price,
-        features:
-          Array.isArray(v.features) && v.features.length > 0
-            ? v.features
-            : Array.isArray(v.amenities)
-            ? v.amenities
-            : [],
-        photo: v.photoUrl || null,
-        review:
-          reviewRating || reviewText
-            ? {
-                rating: reviewRating,
-                text: reviewText,
-              }
-            : null,
-      });
+      let locationData = null;
+
+(async () => {
+  if (v.locationId) {
+    const locSnap = await locationsCol.doc(v.locationId).get();
+    if (locSnap.exists) {
+      locationData = locSnap.data();
+    }
+  }
+})();
+
+recentVisits.push({
+  id: doc.id,
+  locationId: v.locationId || null,
+
+  // ✅ Pull best name/address available
+  name:
+    v.locationName ||
+    locationData?.name ||
+    "Bathroom",
+
+  address:
+    v.locationAddress ||
+    locationData?.address ||
+    "",
+
+  date: tsToIso(v.createdAt),
+  price: price,
+  review: reviewText || null,
+});
     });
 
     // Simple "savings" metric: 20% of total spent (you can adjust later)
