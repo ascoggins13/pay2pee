@@ -238,6 +238,26 @@ router.post(
       const unitAmount = Math.round(Number(price) * 100);
       const applicationFeeAmount = Math.round(unitAmount * 0.30); // 30% platform fee
 
+      const isNative =
+      String(req.headers["x-platform"] || "")
+        .toLowerCase()
+        .trim() === "capacitor";
+        console.log("[guest/checkout] x-platform:", req.headers["x-platform"], "isNative:", isNative);
+
+// ✅ Web URL (what you already use)
+const WEB_URL = process.env.CLIENT_URL || "https://pay2pee.app";
+
+// ✅ App deep link base (add this env var in Render)
+const APP_URL = process.env.APP_URL || "pay2pee://app";
+
+// ✅ Success/cancel differ for native vs web
+const successUrl = isNative
+  ? `${APP_URL}/mypass?session_id={CHECKOUT_SESSION_ID}`
+  : `${WEB_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`;
+
+const cancelUrl = isNative
+  ? `${APP_URL}/home`
+  : `${WEB_URL}/#/home`;
       const session = await stripe.checkout.sessions.create({
         mode: "payment",
         payment_method_types: ["card"],
@@ -263,8 +283,8 @@ router.post(
 
         metadata: { locationId, userId, partnerId, destinationAccountId },
 
-        success_url: `${process.env.CLIENT_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.CLIENT_URL}/#/home`,
+        success_url: successUrl,
+        cancel_url: cancelUrl,
       });
 
       return res.json({ sessionId: session.id, url: session.url });
