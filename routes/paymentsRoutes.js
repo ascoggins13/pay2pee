@@ -239,24 +239,25 @@ router.post(
       const applicationFeeAmount = Math.round(unitAmount * 0.30); // 30% platform fee
 
       const isNative =
-      String(req.headers["x-platform"] || "")
-        .toLowerCase()
-        .trim() === "capacitor";
-        console.log("[guest/checkout] x-platform:", req.headers["x-platform"], "isNative:", isNative);
+  String(req.headers["x-platform"] || "")
+    .toLowerCase()
+    .trim() === "capacitor";
 
-// ✅ Web URL (what you already use)
+console.log("[guest/checkout] x-platform:", req.headers["x-platform"], "isNative:", isNative);
+
+// ✅ Web URL (unchanged)
 const WEB_URL = process.env.CLIENT_URL || "https://pay2pee.app";
 
-// ✅ App deep link base (add this env var in Render)
-const APP_URL = process.env.APP_URL || "pay2pee://app";
+// ✅ Deep link scheme ONLY (important fix)
+const APP_SCHEME = process.env.APP_SCHEME || "pay2pee";
 
-// ✅ Success/cancel differ for native vs web
+// ✅ Correct success/cancel URLs
 const successUrl = isNative
-  ? `${APP_URL}/mypass?session_id={CHECKOUT_SESSION_ID}`
+  ? `${APP_SCHEME}://mypass?session_id={CHECKOUT_SESSION_ID}`
   : `${WEB_URL}/#/mypass?session_id={CHECKOUT_SESSION_ID}`;
 
 const cancelUrl = isNative
-  ? `${APP_URL}/home`
+  ? `${APP_SCHEME}://home`
   : `${WEB_URL}/#/home`;
       const session = await stripe.checkout.sessions.create({
         mode: "payment",
@@ -441,7 +442,7 @@ router.get("/guest/session/:sessionId", async (req, res) => {
 
         const locData = locLive.data() || {};
         const graceMs = toMillis(locData.graceEndsAt);
-          const graceActive = graceMs && graceMs > Date.now();;
+          const graceActive = graceMs && graceMs > Date.now();
 
         const canStartNow =
           !!locData.autoAcceptGuests &&
