@@ -472,6 +472,56 @@ router.post("/avatar", protect, upload.single("file"), async (req, res) => {
     console.error("POST /users/avatar error:", err);
     return res.status(500).json({ error: "Avatar upload failed" });
   }
+  /**
+ * DELETE /account
+ *
+ * Permanently deletes the user account and related data.
+ * Required for Apple App Store compliance.
+ */
+router.delete("/account", protect, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // 1. Get user (for optional cleanup like avatar)
+    const userSnap = await usersCol.doc(userId).get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+
+    // 2. Delete related guest visits (best effort)
+    try {
+      const visitsSnap = await guestVisitsCol
+        .where("userId", "==", userId)
+        .get();
+
+      const batch = firestore.batch();
+      visitsSnap.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+    } catch (err) {
+      console.warn("Guest visits cleanup failed (continuing):", err.message);
+    }
+
+    // 3. Delete avatar from storage (if exists)
+    try {
+      if (userData.avatarUrl) {
+        const bucket = admin.storage().bucket();
+        const filePath = `users/${userId}/avatar.jpg`;
+        await bucket.file(filePath).delete().catch(() => {});
+      }
+    } catch (err) {
+      console.warn("Avatar cleanup failed (continuing):", err.message);
+    }
+
+    // 4. Delete user document
+    await usersCol.doc(userId).delete();
+
+    return res.json({
+      success: true,
+      message: "Account deleted successfully",
+    });
+  } catch (err) {
+    console.error("DELETE /users/account error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
 });
 module.exports = router;
 

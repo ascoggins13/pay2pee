@@ -2,6 +2,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { admin, firestore } = require('../firebase-admin');
 
 const router = express.Router();
@@ -107,7 +108,6 @@ router.post('/login', async (req, res) => {
     const user = { id: doc.id, ...doc.data() };
     const storedType = String(user.userType || '').toLowerCase();
 
-    // ✅ SAFETY FIX:
     // Partners MUST log in as partner
     if (storedType === 'partner' && typeAttempt !== 'partner') {
       return res.status(403).json({
@@ -146,6 +146,69 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error('LOGIN error:', err);
     return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// =====================================
+// POST /api/auth/forgot-password
+// =====================================
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const emailNorm = normalizeEmail(req.body?.email);
+
+    if (!emailNorm) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email is required',
+      });
+    }
+
+    const snap = await usersCol
+      .where('emailLower', '==', emailNorm)
+      .limit(1)
+      .get();
+
+    // Always return success-like response so people can't probe accounts
+    if (snap.empty) {
+      return res.json({
+        success: true,
+        message: 'If that email exists, a reset link has been sent.',
+      });
+    }
+
+    const doc = snap.docs[0];
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetTokenExpiresAt = admin.firestore.Timestamp.fromMillis(
+      Date.now() + 1000 * 60 * 30 // 30 minutes
+    );
+
+    await doc.ref.set(
+      {
+        passwordResetToken: resetToken,
+        passwordResetTokenExpiresAt: resetTokenExpiresAt,
+        updatedAt: now(),
+      },
+      { merge: true }
+    );
+
+    // TODO:
+    // Send email here when your email service is ready.
+    // Example reset URL:
+    // `${process.env.CLIENT_URL}/#/reset-password?token=${resetToken}&email=${encodeURIComponent(emailNorm)}`
+
+    console.log('[FORGOT PASSWORD] Reset token created for:', emailNorm);
+    console.log('[FORGOT PASSWORD] Token:', resetToken);
+
+    return res.json({
+      success: true,
+      message: 'If that email exists, a reset link has been sent.',
+    });
+  } catch (err) {
+    console.error('FORGOT PASSWORD error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error',
+    });
   }
 });
 
