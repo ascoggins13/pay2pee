@@ -447,7 +447,7 @@ router.post("/avatar", protect, upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "Missing file" });
 
     // firebase-admin storage bucket
-    const bucket = admin.storage().bucket(); // uses default bucket from firebase-admin init
+    const bucket = admin.storage().bucket();
     const filePath = `users/${userId}/avatar.jpg`;
 
     const file = bucket.file(filePath);
@@ -463,7 +463,10 @@ router.post("/avatar", protect, upload.single("file"), async (req, res) => {
 
     // Save URL on user doc
     await usersCol.doc(userId).set(
-      { avatarUrl: publicUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      {
+        avatarUrl: publicUrl,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
       { merge: true }
     );
 
@@ -472,7 +475,9 @@ router.post("/avatar", protect, upload.single("file"), async (req, res) => {
     console.error("POST /users/avatar error:", err);
     return res.status(500).json({ error: "Avatar upload failed" });
   }
-  /**
+});
+
+/**
  * DELETE /account
  *
  * Permanently deletes the user account and related data.
@@ -522,6 +527,5 @@ router.delete("/account", protect, async (req, res) => {
     return res.status(500).json({ error: "Server error" });
   }
 });
-});
-module.exports = router;
 
+module.exports = router;
