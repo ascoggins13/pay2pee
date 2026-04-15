@@ -84,6 +84,12 @@ if (process.env.NODE_ENV === 'production') {
     res.send('Pay2Pee API (development)');
   });
 }
+/* ---------------- referrals route ---------------------- */
+const referralsAdminReadRoutes = require("./routes/referralsAdminReadRoutes");
+app.use("/api/admin/referrals", referralsAdminReadRoutes);
+
+const referralsAdminRoutes = require("./routes/referralsAdminRoutes");
+app.use("/api/admin/referrals", referralsAdminRoutes);
 
 /* ---------------- API 404 (fallback) ---------------------- */
 

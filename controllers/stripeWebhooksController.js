@@ -1,7 +1,7 @@
 // controllers/stripeWebhooksController.js
 const admin = require('firebase-admin');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
+const { recordPaymentEarning } = require("../services/referralsService");
 const db = admin.firestore();
 const usersCol = db.collection('users');
 const processedEventsCol = db.collection('stripeProcessedEvents'); // optional idempotency
@@ -80,16 +80,66 @@ exports.handleStripeEvent = async (event) => {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
         await upsertUserSubscription(userRef, { subscription });
       } else if (mode === 'payment') {
-        // one-time purchase (single-use pass) – record entitlement/credit
-        await userRef.set({
-          lastOneTimePurchase: {
-            sessionId: session.id,
-            amountTotal: session.amount_total || null,
-            currency: session.currency || 'usd',
-            purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
+        const metadata = session.metadata || {};
+        const userId = metadata.userId || session.client_reference_id || null;
+        const locationId = metadata.locationId || null;
+        const partnerId = metadata.partnerId || null;
+        const destinationAccountId = metadata.destinationAccountId || null;
+      
+        const grossAmount = Number(session.amount_total || 0);
+      
+        let stripePaymentIntentId = null;
+        let platformFeeAmount = null;
+      
+        if (session.payment_intent) {
+          stripePaymentIntentId =
+            typeof session.payment_intent === "string"
+              ? session.payment_intent
+              : session.payment_intent.id;
+      
+          try {
+            const paymentIntent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
+            if (Number.isInteger(paymentIntent?.application_fee_amount)) {
+              platformFeeAmount = paymentIntent.application_fee_amount;
+            }
+          } catch (piErr) {
+            console.error("Error retrieving payment intent:", piErr.message);
+          }
+        }
+      
+        if (!Number.isInteger(platformFeeAmount)) {
+          platformFeeAmount = Math.round(grossAmount * 0.30);
+        }
+      
+        await recordPaymentEarning({
+          stripeEventId: event.id,
+          stripeSessionId: session.id,
+          stripePaymentIntentId,
+          userId,
+          partnerId,
+          locationId,
+          destinationAccountId,
+          grossAmount,
+          platformFeeAmount,
+          currency: session.currency || "usd",
+          paidAtDate: new Date(),
+        });
+      
+        if (userId) {
+          const userRef = usersCol.doc(userId);
+          await userRef.set(
+            {
+              lastOneTimePurchase: {
+                sessionId: session.id,
+                amountTotal: session.amount_total || null,
+                currency: session.currency || "usd",
+                purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
       }
       break;
     }
