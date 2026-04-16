@@ -91,6 +91,9 @@ app.use("/api/admin/referrals", referralsAdminReadRoutes);
 const referralsAdminRoutes = require("./routes/referralsAdminRoutes");
 app.use("/api/admin/referrals", referralsAdminRoutes);
 
+const referralsPublicRoutes = require("./routes/referralsPublicRoutes");
+app.use("/api/referrals", referralsPublicRoutes);
+
 /* ---------------- API 404 (fallback) ---------------------- */
 
 app.use('/api/*', (_req, res) => {
